@@ -20,7 +20,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/build"
+	"github.com/pkg/errors"
+
 	"github.com/syncthing/syncthing/lib/rand"
 )
 
@@ -70,11 +71,6 @@ var (
 func init() {
 	// Creates the list of ciper suites that SecureDefault uses.
 	cipherSuites = buildCipherSuites()
-	if build.IsBeta {
-		// Append "tls13=1" to GODEBUG before starting TLS, to enable TLS
-		// 1.3 in Go 1.12.
-		os.Setenv("GODEBUG", os.Getenv("GODEBUG")+",tls13=1")
-	}
 }
 
 // SecureDefault returns a tls.Config with reasonable, secure defaults set.
@@ -95,15 +91,17 @@ func SecureDefault() *tls.Config {
 }
 
 // NewCertificate generates and returns a new TLS certificate.
-func NewCertificate(certFile, keyFile, commonName string) (tls.Certificate, error) {
+func NewCertificate(certFile, keyFile, commonName string, lifetimeDays int) (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "generate key")
 	}
 
-	notBefore := time.Now()
-	notAfter := time.Date(2049, 12, 31, 23, 59, 59, 0, time.UTC)
+	notBefore := time.Now().Truncate(24 * time.Hour)
+	notAfter := notBefore.Add(time.Duration(lifetimeDays*24) * time.Hour)
 
+	// NOTE: update checkExpiry() appropriately if you add or change attributes
+	// in here, especially DNSNames or IPAddresses.
 	template := x509.Certificate{
 		SerialNumber: new(big.Int).SetInt64(rand.Int63()),
 		Subject: pkix.Name{
@@ -119,39 +117,39 @@ func NewCertificate(certFile, keyFile, commonName string) (tls.Certificate, erro
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(priv), priv)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "create cert")
 	}
 
 	certOut, err := os.Create(certFile)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 	err = certOut.Close()
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save cert: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save cert")
 	}
 
 	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	block, err := pemBlockForKey(priv)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	err = pem.Encode(keyOut, block)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 	err = keyOut.Close()
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("save key: %s", err)
+		return tls.Certificate{}, errors.Wrap(err, "save key")
 	}
 
 	return tls.LoadX509KeyPair(certFile, keyFile)

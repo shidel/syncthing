@@ -7,6 +7,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -66,6 +67,7 @@ func TestProgressEmitter(t *testing.T) {
 
 	p := NewProgressEmitter(c, evLogger)
 	go p.Serve()
+	defer p.Stop()
 	p.interval = 0
 
 	expectTimeout(w, t)
@@ -460,5 +462,5 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 func sendMsgs(p *ProgressEmitter) {
 	p.mut.Lock()
 	defer p.mut.Unlock()
-	p.sendDownloadProgressMessagesLocked()
+	p.sendDownloadProgressMessagesLocked(context.Background())
 }

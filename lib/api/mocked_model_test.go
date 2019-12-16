@@ -10,7 +10,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/model"
@@ -49,12 +48,12 @@ func (m *mockedModel) ConnectionStats() map[string]interface{} {
 	return nil
 }
 
-func (m *mockedModel) DeviceStatistics() map[string]stats.DeviceStatistics {
-	return nil
+func (m *mockedModel) DeviceStatistics() (map[string]stats.DeviceStatistics, error) {
+	return nil, nil
 }
 
-func (m *mockedModel) FolderStatistics() map[string]stats.FolderStatistics {
-	return nil
+func (m *mockedModel) FolderStatistics() (map[string]stats.FolderStatistics, error) {
+	return nil, nil
 }
 
 func (m *mockedModel) CurrentFolderFile(folder string, file string) (protocol.FileInfo, bool) {
@@ -153,21 +152,29 @@ func (m *mockedModel) LocalChangedFiles(folder string, page, perpage int) []db.F
 	return nil
 }
 
-func (m *mockedModel) Serve()                                                                     {}
-func (m *mockedModel) Stop()                                                                      {}
-func (m *mockedModel) Index(deviceID protocol.DeviceID, folder string, files []protocol.FileInfo) {}
-func (m *mockedModel) IndexUpdate(deviceID protocol.DeviceID, folder string, files []protocol.FileInfo) {
+func (m *mockedModel) Serve() {}
+func (m *mockedModel) Stop()  {}
+
+func (m *mockedModel) Index(deviceID protocol.DeviceID, folder string, files []protocol.FileInfo) error {
+	return nil
+}
+
+func (m *mockedModel) IndexUpdate(deviceID protocol.DeviceID, folder string, files []protocol.FileInfo) error {
+	return nil
 }
 
 func (m *mockedModel) Request(deviceID protocol.DeviceID, folder, name string, size int32, offset int64, hash []byte, weakHash uint32, fromTemporary bool) (protocol.RequestResponse, error) {
 	return nil, nil
 }
 
-func (m *mockedModel) ClusterConfig(deviceID protocol.DeviceID, config protocol.ClusterConfig) {}
+func (m *mockedModel) ClusterConfig(deviceID protocol.DeviceID, config protocol.ClusterConfig) error {
+	return nil
+}
 
 func (m *mockedModel) Closed(conn protocol.Connection, err error) {}
 
-func (m *mockedModel) DownloadProgress(deviceID protocol.DeviceID, folder string, updates []protocol.FileDownloadProgressUpdate) {
+func (m *mockedModel) DownloadProgress(deviceID protocol.DeviceID, folder string, updates []protocol.FileDownloadProgressUpdate) error {
+	return nil
 }
 
 func (m *mockedModel) AddConnection(conn connections.Connection, hello protocol.HelloResult) {}
@@ -179,11 +186,5 @@ func (m *mockedModel) OnHello(protocol.DeviceID, net.Addr, protocol.HelloResult)
 func (m *mockedModel) GetHello(protocol.DeviceID) protocol.HelloIntf {
 	return nil
 }
-
-func (m *mockedModel) AddFolder(cfg config.FolderConfiguration) {}
-
-func (m *mockedModel) RestartFolder(from, to config.FolderConfiguration) {}
-
-func (m *mockedModel) StartFolder(folder string) {}
 
 func (m *mockedModel) StartDeadlockDetector(timeout time.Duration) {}

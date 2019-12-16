@@ -45,19 +45,8 @@ import (
 )
 
 const (
-	exitSuccess            = 0
-	exitError              = 1
-	exitNoUpgradeAvailable = 2
-	exitRestarting         = 3
-	exitUpgrading          = 4
-)
-
-const (
-	bepProtocolName      = "bep/1.0"
-	tlsDefaultCommonName = "syncthing"
-	maxSystemErrors      = 5
-	initialSystemLog     = 10
-	maxSystemLog         = 250
+	tlsDefaultCommonName   = "syncthing"
+	deviceCertLifetimeDays = 20 * 365
 )
 
 const (
@@ -165,6 +154,8 @@ type RuntimeOptions struct {
 	browserOnly      bool
 	hideConsole      bool
 	logFile          string
+	logMaxSize       int
+	logMaxFiles      int
 	auditEnabled     bool
 	auditFile        string
 	paused           bool
@@ -191,6 +182,8 @@ func defaultRuntimeOptions() RuntimeOptions {
 		cpuProfile:   os.Getenv("STCPUPROFILE") != "",
 		stRestarting: os.Getenv("STRESTART") != "",
 		logFlags:     log.Ltime,
+		logMaxSize:   10 << 20, // 10 MiB
+		logMaxFiles:  3,        // plus the current one
 	}
 
 	if os.Getenv("STTRACE") != "" {
@@ -233,6 +226,8 @@ func parseCommandLineOptions() RuntimeOptions {
 	flag.BoolVar(&options.paused, "paused", false, "Start with all devices and folders paused")
 	flag.BoolVar(&options.unpaused, "unpaused", false, "Start with all devices and folders unpaused")
 	flag.StringVar(&options.logFile, "logfile", options.logFile, "Log file name (still always logs to stdout). Cannot be used together with -no-restart/STNORESTART environment variable.")
+	flag.IntVar(&options.logMaxSize, "log-max-size", options.logMaxSize, "Maximum size of any file (zero to disable log rotation).")
+	flag.IntVar(&options.logMaxFiles, "log-max-old-files", options.logMaxFiles, "Number of old files to keep (zero to keep only current).")
 	flag.StringVar(&options.auditFile, "auditfile", options.auditFile, "Specify audit file (use \"-\" for stdout, \"--\" for stderr)")
 	flag.BoolVar(&options.allowNewerConfig, "allow-newer-config", false, "Allow loading newer than current config version")
 	if runtime.GOOS == "windows" {
@@ -271,7 +266,7 @@ func main() {
 	// default location
 	if options.noRestart && (options.logFile != "" && options.logFile != "-") {
 		l.Warnln("-logfile may not be used with -no-restart or STNORESTART")
-		os.Exit(exitError)
+		os.Exit(syncthing.ExitError.AsInt())
 	}
 
 	if options.hideConsole {
@@ -285,12 +280,12 @@ func main() {
 			options.confDir, err = filepath.Abs(options.confDir)
 			if err != nil {
 				l.Warnln("Failed to make options path absolute:", err)
-				os.Exit(exitError)
+				os.Exit(syncthing.ExitError.AsInt())
 			}
 		}
 		if err := locations.SetBaseDir(locations.ConfigBaseDir, options.confDir); err != nil {
 			l.Warnln(err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 	}
 
@@ -328,7 +323,7 @@ func main() {
 		)
 		if err != nil {
 			l.Warnln("Error reading device ID:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 
 		fmt.Println(protocol.NewDeviceID(cert.Certificate[0]))
@@ -338,7 +333,7 @@ func main() {
 	if options.browserOnly {
 		if err := openGUI(protocol.EmptyDeviceID); err != nil {
 			l.Warnln("Failed to open web UI:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		return
 	}
@@ -346,7 +341,7 @@ func main() {
 	if options.generateDir != "" {
 		if err := generate(options.generateDir); err != nil {
 			l.Warnln("Failed to generate config and keys:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		return
 	}
@@ -354,14 +349,14 @@ func main() {
 	// Ensure that our home directory exists.
 	if err := ensureDir(locations.GetBaseDir(locations.ConfigBaseDir), 0700); err != nil {
 		l.Warnln("Failure on home directory:", err)
-		os.Exit(exitError)
+		os.Exit(syncthing.ExitError.AsInt())
 	}
 
 	if options.upgradeTo != "" {
 		err := upgrade.ToURL(options.upgradeTo)
 		if err != nil {
 			l.Warnln("Error while Upgrading:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		l.Infoln("Upgraded from", options.upgradeTo)
 		return
@@ -381,7 +376,7 @@ func main() {
 	if options.resetDatabase {
 		if err := resetDB(); err != nil {
 			l.Warnln("Resetting database:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		return
 	}
@@ -424,7 +419,7 @@ func generate(generateDir string) error {
 	if err == nil {
 		l.Warnln("Key exists; will not overwrite.")
 	} else {
-		cert, err = tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName)
+		cert, err = tlsutil.NewCertificate(certFile, keyFile, tlsDefaultCommonName, deviceCertLifetimeDays)
 		if err != nil {
 			return errors.Wrap(err, "create certificate")
 		}
@@ -476,13 +471,13 @@ func checkUpgrade() upgrade.Release {
 	release, err := upgrade.LatestRelease(opts.ReleasesURL, build.Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		l.Warnln("Upgrade:", err)
-		os.Exit(exitError)
+		os.Exit(syncthing.ExitError.AsInt())
 	}
 
 	if upgrade.CompareVersions(release.Tag, build.Version) <= 0 {
 		noUpgradeMessage := "No upgrade available (current %q >= latest %q)."
 		l.Infof(noUpgradeMessage, build.Version, release.Tag)
-		os.Exit(exitNoUpgradeAvailable)
+		os.Exit(syncthing.ExitNoUpgradeAvailable.AsInt())
 	}
 
 	l.Infof("Upgrade available (current %q < latest %q)", build.Version, release.Tag)
@@ -491,12 +486,12 @@ func checkUpgrade() upgrade.Release {
 
 func performUpgrade(release upgrade.Release) {
 	// Use leveldb database locks to protect against concurrent upgrades
-	_, err := syncthing.OpenGoleveldb(locations.Get(locations.Database), config.TuningAuto)
+	_, err := syncthing.OpenDBBackend(locations.Get(locations.Database), config.TuningAuto)
 	if err == nil {
 		err = upgrade.To(release)
 		if err != nil {
 			l.Warnln("Upgrade:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		l.Infof("Upgraded to %q", release.Tag)
 	} else {
@@ -504,10 +499,10 @@ func performUpgrade(release upgrade.Release) {
 		err = upgradeViaRest()
 		if err != nil {
 			l.Warnln("Upgrade:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		l.Infoln("Syncthing upgrading")
-		os.Exit(exitUpgrading)
+		os.Exit(syncthing.ExitUpgrade.AsInt())
 	}
 }
 
@@ -523,7 +518,7 @@ func upgradeViaRest() error {
 	r.Header.Set("X-API-Key", cfg.GUI().APIKey)
 
 	tr := &http.Transport{
-		Dial:            dialer.Dial,
+		DialContext:     dialer.DialContext,
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -573,7 +568,7 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	cfg, err := syncthing.LoadConfigAtStartup(locations.Get(locations.ConfigFile), cert, evLogger, runtimeOptions.allowNewerConfig, noDefaultFolder)
 	if err != nil {
 		l.Warnln("Failed to initialize config:", err)
-		os.Exit(exitError)
+		os.Exit(syncthing.ExitError.AsInt())
 	}
 
 	if runtimeOptions.unpaused {
@@ -583,7 +578,7 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	}
 
 	dbFile := locations.Get(locations.Database)
-	ldb, err := syncthing.OpenGoleveldb(dbFile, cfg.Options().DatabaseTuning)
+	ldb, err := syncthing.OpenDBBackend(dbFile, cfg.Options().DatabaseTuning)
 	if err != nil {
 		l.Warnln("Error opening database:", err)
 		os.Exit(1)
@@ -610,11 +605,11 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		f, err := os.Create(fmt.Sprintf("cpu-%d.pprof", os.Getpid()))
 		if err != nil {
 			l.Warnln("Creating profile:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		if err := pprof.StartCPUProfile(f); err != nil {
 			l.Warnln("Starting profile:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 	}
 
@@ -647,7 +642,9 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		}
 	}
 
-	app.Start()
+	if err := app.Start(); err != nil {
+		os.Exit(syncthing.ExitError.AsInt())
+	}
 
 	cleanConfigDirectory()
 
@@ -721,7 +718,7 @@ func auditWriter(auditFile string) io.Writer {
 		fd, err = os.OpenFile(auditFile, auditFlags, 0600)
 		if err != nil {
 			l.Warnln("Audit:", err)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 		auditDest = auditFile
 	}
@@ -897,6 +894,6 @@ func setPauseState(cfg config.Wrapper, paused bool) {
 	}
 	if _, err := cfg.Replace(raw); err != nil {
 		l.Warnln("Cannot adjust paused state:", err)
-		os.Exit(exitError)
+		os.Exit(syncthing.ExitError.AsInt())
 	}
 }

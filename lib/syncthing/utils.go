@@ -16,7 +16,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/locations"
@@ -35,6 +35,7 @@ func LoadOrGenerateCertificate(certFile, keyFile string) (tls.Certificate, error
 			locations.Get(locations.CertFile),
 			locations.Get(locations.KeyFile),
 			tlsDefaultCommonName,
+			deviceCertLifetimeDays,
 		)
 	}
 	return cert, nil
@@ -122,6 +123,6 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-func OpenGoleveldb(path string, tuning config.Tuning) (*db.Lowlevel, error) {
-	return db.Open(path, db.Tuning(tuning))
+func OpenDBBackend(path string, tuning config.Tuning) (backend.Backend, error) {
+	return backend.Open(path, backend.Tuning(tuning))
 }

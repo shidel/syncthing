@@ -60,7 +60,9 @@ angular.module('syncthing.core')
         } catch (exception) { }
 
         $scope.folderDefaults = {
+            sharedDevices: {},
             selectedDevices: {},
+            unrelatedDevices: {},
             type: "sendreceive",
             rescanIntervalS: 3600,
             fsWatcherDelayS: 10,
@@ -103,7 +105,7 @@ angular.module('syncthing.core')
         $scope.needIcons = {
             'rm': 'far fa-fw fa-trash-alt',
             'rmdir': 'far fa-fw fa-trash-alt',
-            'sync': 'far fa-fw arrow-alt-circle-down',
+            'sync': 'far fa-fw fa-arrow-alt-circle-down',
             'touch': 'fas fa-fw fa-asterisk'
         };
 
@@ -387,6 +389,7 @@ angular.module('syncthing.core')
             });
 
             refreshNoAuthWarning();
+            setDefaultTheme();
 
             if (!hasConfig) {
                 $scope.$emit('ConfigLoaded');
@@ -649,6 +652,23 @@ angular.module('syncthing.core')
             $scope.remoteNeedDevice = undefined;
         }
 
+
+        function setDefaultTheme() {
+            if (!document.getElementById("fallback-theme-css")){
+
+                // check if no support for prefers-color-scheme
+                var colorSchemeNotSupported = typeof window.matchMedia === "undefined" || window.matchMedia('(prefers-color-scheme: dark)').media === 'not all';
+
+                if ($scope.config.gui.theme === "default" && colorSchemeNotSupported) {
+                    document.documentElement.style.display = 'none';
+                    document.head.insertAdjacentHTML(
+                      'beforeend',
+                      '<link id="fallback-theme-css" rel="stylesheet" href="theme-assets/light/assets/css/theme.css" onload="document.documentElement.style.display = \'\'">'
+                    );
+                }
+            }
+        }
+
         function saveIgnores(ignores, cb) {
             $http.post(urlbase + '/db/ignores?folder=' + encodeURIComponent($scope.currentFolder.id), {
                 ignore: ignores
@@ -670,7 +690,7 @@ angular.module('syncthing.core')
         };
 
         $scope.refreshFailed = function (page, perpage) {
-            if (!$scope.failed) {
+            if (!$scope.failed || !$scope.failed.folder) {
                 return;
             }
             var url = urlbase + '/folder/errors?folder=' + encodeURIComponent($scope.failed.folder);
@@ -768,25 +788,31 @@ angular.module('syncthing.core')
                 return 'paused';
             }
 
+            var folderInfo = $scope.model[folderCfg.id];
+
             // after restart syncthing process state may be empty
-            if (!$scope.model[folderCfg.id].state) {
+            if (!folderInfo.state) {
                 return 'unknown';
             }
 
-            var state = '' + $scope.model[folderCfg.id].state;
+            var state = '' + folderInfo.state;
             if (state === 'error') {
                 return 'stopped'; // legacy, the state is called "stopped" in the GUI
             }
-            if (state === 'idle' && $scope.model[folderCfg.id].needTotalItems > 0) {
+
+            if (state !== 'idle') {
+                return state;
+            }
+
+            if (folderInfo.needTotalItems > 0) {
                 return 'outofsync';
             }
             if ($scope.hasFailedFiles(folderCfg.id)) {
                 return 'faileditems';
             }
-            if (state === 'scanning') {
-                return state;
+            if (folderInfo.receiveOnlyTotalItems) {
+                return 'localadditions';
             }
-
             if (folderCfg.devices.length <= 1) {
                 return 'unshared';
             }
@@ -797,13 +823,13 @@ angular.module('syncthing.core')
         $scope.folderClass = function (folderCfg) {
             var status = $scope.folderStatus(folderCfg);
 
-            if (status === 'idle') {
+            if (status === 'idle' || status === 'localadditions') {
                 return 'success';
             }
             if (status == 'paused') {
                 return 'default';
             }
-            if (status === 'syncing' || status === 'scanning') {
+            if (status === 'syncing' || status === 'sync-preparing' || status === 'scanning') {
                 return 'primary';
             }
             if (status === 'unknown') {
@@ -968,6 +994,7 @@ angular.module('syncthing.core')
             for (var i = 0; i < folderListCache.length; i++) {
                 var status = $scope.folderStatus(folderListCache[i]);
                 switch (status) {
+                    case 'sync-preparing':
                     case 'syncing':
                         syncCount++;
                         break;
@@ -1193,7 +1220,12 @@ angular.module('syncthing.core')
             }
         };
 
-        $scope.editSettings = function () {
+        $scope.discardChangedSettings = function () {
+            $("#discard-changes-confirmation").modal("hide");
+            $("#settings").off("hide.bs.modal").modal("hide");
+        };
+
+        $scope.showSettings = function () {
             // Make a working copy
             $scope.tmpOptions = angular.copy($scope.config.options);
             $scope.tmpOptions.deviceName = $scope.thisDevice().name;
@@ -1207,26 +1239,19 @@ angular.module('syncthing.core')
             $scope.tmpGUI = angular.copy($scope.config.gui);
             $scope.tmpRemoteIgnoredDevices = angular.copy($scope.config.remoteIgnoredDevices);
             $scope.tmpDevices = angular.copy($scope.config.devices);
-            var settingsModal = $('#settings').modal();
-            settingsModal.one('hidden.bs.modal', function () {
-                $('.nav-tabs a[href="#settings-general"]').tab('show');
-                window.location.hash = "";
-                settingsModal.off('hide.bs.modal');
-            }).on('hide.bs.modal', function (e) {
+            $('#settings').modal("show");
+            $("#settings a[href='#settings-general']").tab("show");
+            $("#settings").on('hide.bs.modal', function (event) {
                 if ($scope.settingsModified()) {
-                    $("#discard-changes-confirmation").modal().one('hidden.bs.modal', function () {
-                        if (!$scope.settingsModified()) {
-                            settingsModal.modal('hide');
-                        }
-                    });
-                    e.preventDefault();
-                    e.stopImmediatePropagation();
-                    return false;
+                    event.preventDefault();
+                    $("#discard-changes-confirmation").modal("show");
+                } else {
+                    $("#settings").off("hide.bs.modal");
                 }
             });
         };
 
-        $scope.saveConfig = function (cb) {
+        $scope.saveConfig = function (callback) {
             var cfg = JSON.stringify($scope.config);
             var opts = {
                 headers: {
@@ -1235,8 +1260,9 @@ angular.module('syncthing.core')
             };
             $http.post(urlbase + '/system/config', cfg, opts).success(function () {
                 refreshConfig();
-                if (cb) {
-                    cb();
+
+                if (callback) {
+                    callback();
                 }
             }).error(function (data, status, headers, config) {
                 refreshConfig();
@@ -1293,6 +1319,7 @@ angular.module('syncthing.core')
                     $scope.tmpOptions.upgradeToPreReleases = false;
                 } else {
                     $scope.tmpOptions.autoUpgradeIntervalH = 0;
+                    $scope.tmpOptions.upgradeToPreReleases = false;
                 }
 
                 // Check if protocol will need to be changed on restart
@@ -1327,7 +1354,7 @@ angular.module('syncthing.core')
                 });
             }
 
-            $('#settings').modal("hide");
+            $("#settings").off("hide.bs.modal").modal("hide");
         };
 
         $scope.saveAdvanced = function () {
@@ -1360,6 +1387,7 @@ angular.module('syncthing.core')
 
         $scope.upgrade = function () {
             restarting = true;
+            $('#upgrade').modal('hide');
             $('#majorUpgrade').modal('hide');
             $('#upgrading').modal();
             $http.post(urlbase + '/system/upgrade').success(function () {
@@ -1398,13 +1426,13 @@ angular.module('syncthing.core')
         };
 
         $scope.selectAllFolders = function () {
-            angular.forEach($scope.folders, function (id) {
+            angular.forEach($scope.folders, function (_, id) {
                 $scope.currentDevice.selectedFolders[id] = true;
             });
         };
 
         $scope.deSelectAllFolders = function () {
-            angular.forEach($scope.folders, function (id) {
+            angular.forEach($scope.folders, function (_, id) {
                 $scope.currentDevice.selectedFolders[id] = false;
             });
         };
@@ -1678,9 +1706,19 @@ angular.module('syncthing.core')
             if ($scope.currentFolder.path.length > 1 && $scope.currentFolder.path.slice(-1) === $scope.system.pathSeparator) {
                 $scope.currentFolder.path = $scope.currentFolder.path.slice(0, -1);
             }
+            // Cache complete device objects indexed by ID for lookups
+            var devMap = deviceMap($scope.devices)
+            $scope.currentFolder.sharedDevices = [];
             $scope.currentFolder.selectedDevices = {};
             $scope.currentFolder.devices.forEach(function (n) {
+                if (n.deviceID !== $scope.myID) {
+                    $scope.currentFolder.sharedDevices.push(devMap[n.deviceID]);
+                }
                 $scope.currentFolder.selectedDevices[n.deviceID] = true;
+            });
+            $scope.currentFolder.unrelatedDevices = $scope.devices.filter(function (n) {
+                return n.deviceID !== $scope.myID
+                    && ! $scope.currentFolder.selectedDevices[n.deviceID]
             });
             if ($scope.currentFolder.versioning && $scope.currentFolder.versioning.type === "trashcan") {
                 $scope.currentFolder.trashcanFileVersioning = true;
@@ -1732,17 +1770,17 @@ angular.module('syncthing.core')
             $scope.editFolderModal();
         };
 
-        $scope.selectAllDevices = function () {
-            var devices = $scope.otherDevices();
+        $scope.selectAllSharedDevices = function (state) {
+            var devices = $scope.currentFolder.sharedDevices;
             for (var i = 0; i < devices.length; i++) {
-                $scope.currentFolder.selectedDevices[devices[i].deviceID] = true;
+                $scope.currentFolder.selectedDevices[devices[i].deviceID] = !!state;
             }
         };
 
-        $scope.deSelectAllDevices = function () {
-            var devices = $scope.otherDevices();
+        $scope.selectAllUnrelatedDevices = function (state) {
+            var devices = $scope.currentFolder.unrelatedDevices;
             for (var i = 0; i < devices.length; i++) {
-                $scope.currentFolder.selectedDevices[devices[i].deviceID] = false;
+                $scope.currentFolder.selectedDevices[devices[i].deviceID] = !!state;
             }
         };
 
@@ -1751,6 +1789,7 @@ angular.module('syncthing.core')
                 $scope.editingExisting = false;
                 $scope.currentFolder = angular.copy($scope.folderDefaults);
                 $scope.currentFolder.id = (data.random.substr(0, 5) + '-' + data.random.substr(5, 5)).toLowerCase();
+                $scope.currentFolder.unrelatedDevices = $scope.otherDevices();
                 $('#folder-ignores textarea').val("");
                 $('#folder-ignores textarea').removeAttr('disabled');
                 $scope.editFolderModal();
@@ -1766,6 +1805,7 @@ angular.module('syncthing.core')
                 importFromOtherDevice: true
             };
             $scope.currentFolder.selectedDevices[device] = true;
+            $scope.currentFolder.unrelatedDevices = $scope.otherDevices();
             $('#folder-ignores textarea').val("");
             $('#folder-ignores textarea').removeAttr('disabled');
             $scope.editFolderModal();
@@ -1791,7 +1831,9 @@ angular.module('syncthing.core')
                     });
                 }
             }
+            delete folderCfg.sharedDevices;
             delete folderCfg.selectedDevices;
+            delete folderCfg.unrelatedDevices;
 
             if (folderCfg.fileVersioningSelector === "trashcan") {
                 folderCfg.versioning = {
@@ -2013,6 +2055,9 @@ angular.module('syncthing.core')
                                 $.each(values, function (idx, value) {
                                     value.modTime = new Date(value.modTime);
                                     value.versionTime = new Date(value.versionTime);
+                                });
+                                values.sort(function (a, b) {
+                                    return b.versionTime - a.versionTime;
                                 });
                             });
                             if (closed) return;

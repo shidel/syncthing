@@ -13,6 +13,7 @@ import (
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -102,15 +103,9 @@ func setupModelWithConnectionFromWrapper(w config.Wrapper) (*model, *fakeConnect
 }
 
 func setupModel(w config.Wrapper) *model {
-	db := db.OpenMemory()
+	db := db.NewLowlevel(backend.OpenMemory())
 	m := newModel(w, myID, "syncthing", "dev", db, nil)
 	m.ServeBackground()
-	for id, cfg := range w.Folders() {
-		if !cfg.Paused {
-			m.AddFolder(cfg)
-			m.StartFolder(id)
-		}
-	}
 
 	m.ScanFolders()
 

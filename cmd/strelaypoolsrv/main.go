@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
@@ -480,7 +481,7 @@ func handleRelayTest(request request) {
 	if debug {
 		log.Println("Request for", request.relay)
 	}
-	if !client.TestRelay(request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3) {
+	if !client.TestRelay(context.TODO(), request.relay.uri, []tls.Certificate{testCert}, time.Second, 2*time.Second, 3) {
 		if debug {
 			log.Println("Test for relay", request.relay, "failed")
 		}
@@ -633,7 +634,7 @@ func createTestCertificate() tls.Certificate {
 	}
 
 	certFile, keyFile := filepath.Join(tmpDir, "cert.pem"), filepath.Join(tmpDir, "key.pem")
-	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv")
+	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv", 20*365)
 	if err != nil {
 		log.Fatalln("Failed to create test X509 key pair:", err)
 	}

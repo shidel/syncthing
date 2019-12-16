@@ -16,6 +16,7 @@ import (
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
+	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
@@ -54,7 +55,7 @@ func TestRecvOnlyRevertDeletes(t *testing.T) {
 
 	// Start the folder. This will cause a scan, should discover the other stuff in the folder
 
-	m.StartFolder("ro")
+	m.startFolder("ro")
 	m.ScanFolder("ro")
 
 	// We should now have two files and two directories.
@@ -125,7 +126,7 @@ func TestRecvOnlyRevertNeeds(t *testing.T) {
 
 	// Start the folder. This will cause a scan.
 
-	m.StartFolder("ro")
+	m.startFolder("ro")
 	m.ScanFolder("ro")
 
 	// Everything should be in sync.
@@ -221,7 +222,7 @@ func TestRecvOnlyUndoChanges(t *testing.T) {
 
 	// Start the folder. This will cause a scan.
 
-	m.StartFolder("ro")
+	m.startFolder("ro")
 	m.ScanFolder("ro")
 
 	// Everything should be in sync.
@@ -316,9 +317,15 @@ func setupROFolder() (*model, *sendOnlyFolder) {
 	fcfg.Type = config.FolderTypeReceiveOnly
 	w.SetFolder(fcfg)
 
-	m := newModel(w, myID, "syncthing", "dev", db.OpenMemory(), nil)
-	m.AddFolder(fcfg)
+	m := newModel(w, myID, "syncthing", "dev", db.NewLowlevel(backend.OpenMemory()), nil)
 
+	m.ServeBackground()
+
+	// Folder should only be added, not started.
+	m.removeFolder(fcfg)
+	m.addFolder(fcfg)
+
+	m.fmut.RLock()
 	f := &sendOnlyFolder{
 		folder: folder{
 			stateTracker:        newStateTracker(fcfg.ID, m.evLogger),
@@ -326,8 +333,7 @@ func setupROFolder() (*model, *sendOnlyFolder) {
 			FolderConfiguration: fcfg,
 		},
 	}
-
-	m.ServeBackground()
+	m.fmut.RUnlock()
 
 	return m, f
 }

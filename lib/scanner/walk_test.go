@@ -322,7 +322,7 @@ func TestWalkRootSymlink(t *testing.T) {
 	}
 	defer os.RemoveAll(tmp)
 
-	link := tmp + "/link"
+	link := filepath.Join(tmp, "link")
 	dest, _ := filepath.Abs("testdata/dir1")
 	if err := osutil.DebugSymlinkForTestsOnly(dest, link); err != nil {
 		if runtime.GOOS == "windows" {
@@ -333,12 +333,32 @@ func TestWalkRootSymlink(t *testing.T) {
 		}
 	}
 
-	// Scan it
+	// Scan root with symlink at FS root
 	files := walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, link), ".", nil, nil, 0)
 
 	// Verify that we got two files
 	if len(files) != 2 {
 		t.Errorf("expected two files, not %d", len(files))
+	}
+
+	// Scan symlink below FS root
+	files = walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, tmp), "link", nil, nil, 0)
+
+	// Verify that we got the one symlink, except on windows
+	if runtime.GOOS == "windows" {
+		if len(files) != 0 {
+			t.Errorf("expected no files, not %d", len(files))
+		}
+	} else if len(files) != 1 {
+		t.Errorf("expected one file, not %d", len(files))
+	}
+
+	// Scan path below symlink
+	files = walkDir(fs.NewFilesystem(fs.FilesystemTypeBasic, tmp), filepath.Join("link", "cfile"), nil, nil, 0)
+
+	// Verify that we get nothing
+	if len(files) != 0 {
+		t.Errorf("expected no files, not %d", len(files))
 	}
 }
 
@@ -742,6 +762,51 @@ func TestNotExistingError(t *testing.T) {
 	fchan := Walk(context.TODO(), cfg)
 	for f := range fchan {
 		t.Fatalf("Expected no result from scan, got %v", f)
+	}
+}
+
+func TestSkipIgnoredDirs(t *testing.T) {
+	tmp, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	fss := fs.NewFilesystem(fs.FilesystemTypeBasic, tmp)
+
+	name := "foo/ignored"
+	err = fss.MkdirAll(name, 0777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stat, err := fss.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := &walker{}
+
+	pats := ignore.New(fss, ignore.WithCache(true))
+
+	stignore := `
+	/foo/ign*
+	!/f*
+	*
+	`
+	if err := pats.Parse(bytes.NewBufferString(stignore), ".stignore"); err != nil {
+		t.Fatal(err)
+	}
+	if !pats.SkipIgnoredDirs() {
+		t.Error("SkipIgnoredDirs should be true")
+	}
+
+	w.Matcher = pats
+
+	fn := w.walkAndHashFiles(context.Background(), nil, nil)
+
+	if err := fn(name, stat, nil); err != fs.SkipDir {
+		t.Errorf("Expected %v, got %v", fs.SkipDir, err)
 	}
 }
 

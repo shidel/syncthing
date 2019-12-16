@@ -4,6 +4,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -74,10 +75,12 @@ func TestClose(t *testing.T) {
 		t.Error("Ping should not return true")
 	}
 
-	c0.Index("default", nil)
-	c0.Index("default", nil)
+	ctx := context.Background()
 
-	if _, err := c0.Request("default", "foo", 0, 0, nil, 0, false); err == nil {
+	c0.Index(ctx, "default", nil)
+	c0.Index(ctx, "default", nil)
+
+	if _, err := c0.Request(ctx, "default", "foo", 0, 0, nil, 0, false); err == nil {
 		t.Error("Request should return an error")
 	}
 }
@@ -151,7 +154,7 @@ func TestCloseRace(t *testing.T) {
 	c0.ClusterConfig(ClusterConfig{})
 	c1.ClusterConfig(ClusterConfig{})
 
-	c1.Index("default", nil)
+	c1.Index(context.Background(), "default", nil)
 	select {
 	case <-indexReceived:
 	case <-time.After(time.Second):
@@ -194,7 +197,7 @@ func TestClusterConfigFirst(t *testing.T) {
 	c.ClusterConfig(ClusterConfig{})
 
 	done := make(chan struct{})
-	if ok := c.send(&Ping{}, done); !ok {
+	if ok := c.send(context.Background(), &Ping{}, done); !ok {
 		t.Fatal("send ping after cluster config returned false")
 	}
 	select {
@@ -431,6 +434,38 @@ func TestLZ4Compression(t *testing.T) {
 			t.Error("Incorrect decompressed data")
 		}
 		t.Logf("OK #%d, %d -> %d -> %d", i, dataLen, len(comp), dataLen)
+	}
+}
+
+func TestStressLZ4CompressGrows(t *testing.T) {
+	c := new(rawConnection)
+	success := 0
+	for i := 0; i < 100; i++ {
+		// Create a slize that is precisely one min block size, fill it with
+		// random data. This shouldn't compress at all, so will in fact
+		// become larger when LZ4 does its thing.
+		data := make([]byte, MinBlockSize)
+		if _, err := rand.Reader.Read(data); err != nil {
+			t.Fatal("randomness failure")
+		}
+
+		comp, err := c.lz4Compress(data)
+		if err != nil {
+			t.Fatal("unexpected compression error: ", err)
+		}
+		if len(comp) < len(data) {
+			// data size should grow. We must have been really unlucky in
+			// the random generation, try again.
+			continue
+		}
+
+		// Putting it into the buffer pool shouldn't panic because the block
+		// should come from there to begin with.
+		BufferPool.Put(comp)
+		success++
+	}
+	if success == 0 {
+		t.Fatal("unable to find data that grows when compressed")
 	}
 }
 

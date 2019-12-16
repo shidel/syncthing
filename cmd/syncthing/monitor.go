@@ -9,10 +9,12 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -23,6 +25,7 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syncthing/syncthing/lib/syncthing"
 )
 
 var (
@@ -47,7 +50,15 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 
 	logFile := runtimeOptions.logFile
 	if logFile != "-" {
-		var fileDst io.Writer = newAutoclosedFile(logFile, logFileAutoCloseDelay, logFileMaxOpenTime)
+		var fileDst io.Writer
+		if runtimeOptions.logMaxSize > 0 {
+			open := func(name string) (io.WriteCloser, error) {
+				return newAutoclosedFile(name, logFileAutoCloseDelay, logFileMaxOpenTime), nil
+			}
+			fileDst = newRotatedFile(logFile, open, int64(runtimeOptions.logMaxSize), runtimeOptions.logMaxFiles)
+		} else {
+			fileDst = newAutoclosedFile(logFile, logFileAutoCloseDelay, logFileMaxOpenTime)
+		}
 
 		if runtime.GOOS == "windows" {
 			// Translate line breaks to Windows standard
@@ -81,7 +92,7 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 
 		if t := time.Since(restarts[0]); t < loopThreshold {
 			l.Warnf("%d restarts in %v; not retrying further", countRestarts, t)
-			os.Exit(exitError)
+			os.Exit(syncthing.ExitError.AsInt())
 		}
 
 		copy(restarts[0:], restarts[1:])
@@ -150,17 +161,14 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 				// Successful exit indicates an intentional shutdown
 				return
 			} else if exiterr, ok := err.(*exec.ExitError); ok {
-				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-					switch status.ExitStatus() {
-					case exitUpgrading:
-						// Restart the monitor process to release the .old
-						// binary as part of the upgrade process.
-						l.Infoln("Restarting monitor...")
-						if err = restartMonitor(args); err != nil {
-							l.Warnln("Restart:", err)
-						}
-						return
+				if exiterr.ExitCode() == syncthing.ExitUpgrade.AsInt() {
+					// Restart the monitor process to release the .old
+					// binary as part of the upgrade process.
+					l.Infoln("Restarting monitor...")
+					if err = restartMonitor(args); err != nil {
+						l.Warnln("Restart:", err)
 					}
+					return
 				}
 			}
 		}
@@ -317,6 +325,81 @@ func restartMonitorWindows(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stdin = os.Stdin
 	return cmd.Start()
+}
+
+// rotatedFile keeps a set of rotating logs. There will be the base file plus up
+// to maxFiles rotated ones, each ~ maxSize bytes large.
+type rotatedFile struct {
+	name        string
+	create      createFn
+	maxSize     int64 // bytes
+	maxFiles    int
+	currentFile io.WriteCloser
+	currentSize int64
+}
+
+// the createFn should act equivalently to os.Create
+type createFn func(name string) (io.WriteCloser, error)
+
+func newRotatedFile(name string, create createFn, maxSize int64, maxFiles int) *rotatedFile {
+	return &rotatedFile{
+		name:     name,
+		create:   create,
+		maxSize:  maxSize,
+		maxFiles: maxFiles,
+	}
+}
+
+func (r *rotatedFile) Write(bs []byte) (int, error) {
+	// Check if we're about to exceed the max size, and if so close this
+	// file so we'll start on a new one.
+	if r.currentSize+int64(len(bs)) > r.maxSize {
+		r.currentFile.Close()
+		r.currentFile = nil
+		r.currentSize = 0
+	}
+
+	// If we have no current log, rotate old files out of the way and create
+	// a new one.
+	if r.currentFile == nil {
+		r.rotate()
+		fd, err := r.create(r.name)
+		if err != nil {
+			return 0, err
+		}
+		r.currentFile = fd
+	}
+
+	n, err := r.currentFile.Write(bs)
+	r.currentSize += int64(n)
+	return n, err
+}
+
+func (r *rotatedFile) rotate() {
+	// The files are named "name", "name.0", "name.1", ...
+	// "name.(r.maxFiles-1)". Increase the numbers on the
+	// suffixed ones.
+	for i := r.maxFiles - 1; i > 0; i-- {
+		from := numberedFile(r.name, i-1)
+		to := numberedFile(r.name, i)
+		err := os.Rename(from, to)
+		if err != nil && !os.IsNotExist(err) {
+			fmt.Println("LOG: Rotating logs:", err)
+		}
+	}
+
+	// Rename the base to base.0
+	err := os.Rename(r.name, numberedFile(r.name, 0))
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Println("LOG: Rotating logs:", err)
+	}
+}
+
+// numberedFile adds the number between the file name and the extension.
+func numberedFile(name string, num int) string {
+	ext := filepath.Ext(name) // contains the dot
+	withoutExt := name[:len(name)-len(ext)]
+	return fmt.Sprintf("%s.%d%s", withoutExt, num, ext)
 }
 
 // An autoclosedFile is an io.WriteCloser that opens itself for appending on

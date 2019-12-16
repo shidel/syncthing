@@ -32,6 +32,7 @@ import (
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/ur"
 	"github.com/thejerf/suture"
 )
@@ -238,10 +239,11 @@ func TestAPIServiceRequests(t *testing.T) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	cases := []httpTestCase{
 		// /rest/db
@@ -450,10 +452,11 @@ func TestHTTPLogin(t *testing.T) {
 	cfg := new(mockedConfig)
 	cfg.gui.User = "üser"
 	cfg.gui.Password = "$2a$10$IdIZTxTg/dCNuNEGlmLynOjqg4B1FvDKuIV5e0BB3pnWVHNb8.GSq" // bcrypt of "räksmörgås" in UTF-8
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	// Verify rejection when not using authorization
 
@@ -511,7 +514,7 @@ func TestHTTPLogin(t *testing.T) {
 	}
 }
 
-func startHTTP(cfg *mockedConfig) (string, error) {
+func startHTTP(cfg *mockedConfig) (string, *suture.Supervisor, error) {
 	m := new(mockedModel)
 	assetDir := "../../gui"
 	eventSub := new(mockedEventSub)
@@ -541,7 +544,8 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	addr := <-addrChan
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		return "", fmt.Errorf("Weird address from API service: %v", err)
+		supervisor.Stop()
+		return "", nil, fmt.Errorf("Weird address from API service: %v", err)
 	}
 
 	host, _, _ := net.SplitHostPort(cfg.gui.RawAddress)
@@ -550,7 +554,7 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	}
 	baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port)))
 
-	return baseURL, nil
+	return baseURL, supervisor, nil
 }
 
 func TestCSRFRequired(t *testing.T) {
@@ -559,13 +563,14 @@ func TestCSRFRequired(t *testing.T) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal("Unexpected error from getting base URL:", err)
 	}
+	defer sup.Stop()
 
 	cli := &http.Client{
-		Timeout: time.Second,
+		Timeout: time.Minute,
 	}
 
 	// Getting the base URL (i.e. "/") should succeed.
@@ -634,10 +639,11 @@ func TestRandomString(t *testing.T) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 	cli := &http.Client{
 		Timeout: time.Second,
 	}
@@ -726,10 +732,11 @@ func testConfigPost(data io.Reader) (*http.Response, error) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer sup.Stop()
 	cli := &http.Client{
 		Timeout: time.Second,
 	}
@@ -746,10 +753,11 @@ func TestHostCheck(t *testing.T) {
 
 	cfg := new(mockedConfig)
 	cfg.gui.RawAddress = "127.0.0.1:0"
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	// A normal HTTP get to the localhost-bound service should succeed
 
@@ -806,10 +814,11 @@ func TestHostCheck(t *testing.T) {
 	cfg = new(mockedConfig)
 	cfg.gui.RawAddress = "127.0.0.1:0"
 	cfg.gui.InsecureSkipHostCheck = true
-	baseURL, err = startHTTP(cfg)
+	baseURL, sup, err = startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	// A request with a suspicious Host header should be allowed
 
@@ -829,10 +838,11 @@ func TestHostCheck(t *testing.T) {
 	cfg = new(mockedConfig)
 	cfg.gui.RawAddress = "0.0.0.0:0"
 	cfg.gui.InsecureSkipHostCheck = true
-	baseURL, err = startHTTP(cfg)
+	baseURL, sup, err = startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	// A request with a suspicious Host header should be allowed
 
@@ -856,10 +866,11 @@ func TestHostCheck(t *testing.T) {
 
 	cfg = new(mockedConfig)
 	cfg.gui.RawAddress = "[::1]:0"
-	baseURL, err = startHTTP(cfg)
+	baseURL, sup, err = startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 
 	// A normal HTTP get to the localhost-bound service should succeed
 
@@ -950,10 +961,11 @@ func TestAccessControlAllowOriginHeader(t *testing.T) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 	cli := &http.Client{
 		Timeout: time.Second,
 	}
@@ -980,10 +992,11 @@ func TestOptionsRequest(t *testing.T) {
 	const testAPIKey = "foobarbaz"
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
-	baseURL, err := startHTTP(cfg)
+	baseURL, sup, err := startHTTP(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sup.Stop()
 	cli := &http.Client{
 		Timeout: time.Second,
 	}
@@ -1115,6 +1128,44 @@ func TestPrefixMatch(t *testing.T) {
 		ret := checkPrefixMatch(tc.s, tc.prefix)
 		if ret != tc.expected {
 			t.Errorf("checkPrefixMatch(%q, %q) => %v, expected %v", tc.s, tc.prefix, ret, tc.expected)
+		}
+	}
+}
+
+func TestCheckExpiry(t *testing.T) {
+	dir, err := ioutil.TempDir("", "syncthing-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Self signed certificates expiring in less than a month are errored so we
+	// can regenerate in time.
+	crt, err := tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 29)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkExpiry(crt); err == nil {
+		t.Error("expected expiry error")
+	}
+
+	// Certificates with at least 31 days of life left are fine.
+	crt, err = tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkExpiry(crt); err != nil {
+		t.Error("expected no error:", err)
+	}
+
+	if runtime.GOOS == "darwin" {
+		// Certificates with too long an expiry time are not allowed on macOS
+		crt, err = tlsutil.NewCertificate(filepath.Join(dir, "crt"), filepath.Join(dir, "key"), "foo.example.com", 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := checkExpiry(crt); err == nil {
+			t.Error("expected expiry error")
 		}
 	}
 }

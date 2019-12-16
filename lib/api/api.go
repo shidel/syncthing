@@ -8,8 +8,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -56,10 +59,11 @@ import (
 var bcryptExpr = regexp.MustCompile(`^\$2[aby]\$\d+\$.{50,}`)
 
 const (
-	DefaultEventMask    = events.AllEvents &^ events.LocalChangeDetected &^ events.RemoteChangeDetected
-	DiskEventMask       = events.LocalChangeDetected | events.RemoteChangeDetected
-	EventSubBufferSize  = 1000
-	defaultEventTimeout = time.Minute
+	DefaultEventMask      = events.AllEvents &^ events.LocalChangeDetected &^ events.RemoteChangeDetected
+	DiskEventMask         = events.LocalChangeDetected | events.RemoteChangeDetected
+	EventSubBufferSize    = 1000
+	defaultEventTimeout   = time.Minute
+	httpsCertLifetimeDays = 820
 )
 
 type service struct {
@@ -133,7 +137,7 @@ func New(id protocol.DeviceID, cfg config.Wrapper, assetDir, tlsDefaultCommonNam
 		configChanged:        make(chan struct{}),
 		startedOnce:          make(chan struct{}),
 	}
-	s.Service = util.AsService(s.serve)
+	s.Service = util.AsService(s.serve, s.String())
 	return s
 }
 
@@ -146,6 +150,12 @@ func (s *service) getListener(guiCfg config.GUIConfiguration) (net.Listener, err
 	httpsCertFile := locations.Get(locations.HTTPSCertFile)
 	httpsKeyFile := locations.Get(locations.HTTPSKeyFile)
 	cert, err := tls.LoadX509KeyPair(httpsCertFile, httpsKeyFile)
+
+	// If the certificate has expired or will expire in the next month, fail
+	// it and generate a new one.
+	if err == nil {
+		err = checkExpiry(cert)
+	}
 	if err != nil {
 		l.Infoln("Loading HTTPS certificate:", err)
 		l.Infoln("Creating new HTTPS certificate")
@@ -158,7 +168,7 @@ func (s *service) getListener(guiCfg config.GUIConfiguration) (net.Listener, err
 			name = s.tlsDefaultCommonName
 		}
 
-		cert, err = tlsutil.NewCertificate(httpsCertFile, httpsKeyFile, name)
+		cert, err = tlsutil.NewCertificate(httpsCertFile, httpsKeyFile, name, httpsCertLifetimeDays)
 	}
 	if err != nil {
 		return nil, err
@@ -198,7 +208,7 @@ func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
 	fmt.Fprintf(w, "%s\n", bs)
 }
 
-func (s *service) serve(stop chan struct{}) {
+func (s *service) serve(ctx context.Context) {
 	listener, err := s.getListener(s.cfg.GUI())
 	if err != nil {
 		select {
@@ -351,7 +361,10 @@ func (s *service) serve(stop chan struct{}) {
 	l.Infoln("Access the GUI via the following URL:", guiCfg.URL())
 	if s.started != nil {
 		// only set when run by the tests
-		s.started <- listener.Addr().String()
+		select {
+		case <-ctx.Done(): // Shouldn't return directly due to cleanup below
+		case s.started <- listener.Addr().String():
+		}
 	}
 
 	// Indicate successful initial startup, to ourselves and to interested
@@ -366,13 +379,16 @@ func (s *service) serve(stop chan struct{}) {
 
 	serveError := make(chan error, 1)
 	go func() {
-		serveError <- srv.Serve(listener)
+		select {
+		case serveError <- srv.Serve(listener):
+		case <-ctx.Done():
+		}
 	}()
 
 	// Wait for stop, restart or error signals
 
 	select {
-	case <-stop:
+	case <-ctx.Done():
 		// Shutting down permanently
 		l.Debugln("shutting down (stop)")
 	case <-s.configChanged:
@@ -759,11 +775,21 @@ func (s *service) getSystemConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *service) getDeviceStats(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, s.model.DeviceStatistics())
+	stats, err := s.model.DeviceStatistics()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	sendJSON(w, stats)
 }
 
 func (s *service) getFolderStats(w http.ResponseWriter, r *http.Request) {
-	sendJSON(w, s.model.FolderStatistics())
+	stats, err := s.model.FolderStatistics()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	sendJSON(w, stats)
 }
 
 func (s *service) getDBFile(w http.ResponseWriter, r *http.Request) {
@@ -1573,10 +1599,10 @@ func (s *service) getHeapProf(w http.ResponseWriter, r *http.Request) {
 	pprof.WriteHeapProfile(w)
 }
 
-func toJsonFileInfoSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
-	res := make([]jsonDBFileInfo, len(fs))
+func toJsonFileInfoSlice(fs []db.FileInfoTruncated) []jsonFileInfoTrunc {
+	res := make([]jsonFileInfoTrunc, len(fs))
 	for i, f := range fs {
-		res[i] = jsonDBFileInfo(f)
+		res[i] = jsonFileInfoTrunc(f)
 	}
 	return res
 }
@@ -1586,45 +1612,39 @@ func toJsonFileInfoSlice(fs []db.FileInfoTruncated) []jsonDBFileInfo {
 type jsonFileInfo protocol.FileInfo
 
 func (f jsonFileInfo) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
-		"name":          f.Name,
-		"type":          f.Type,
-		"size":          f.Size,
-		"permissions":   fmt.Sprintf("%#o", f.Permissions),
-		"deleted":       f.Deleted,
-		"invalid":       protocol.FileInfo(f).IsInvalid(),
-		"ignored":       protocol.FileInfo(f).IsIgnored(),
-		"mustRescan":    protocol.FileInfo(f).MustRescan(),
-		"noPermissions": f.NoPermissions,
-		"modified":      protocol.FileInfo(f).ModTime(),
-		"modifiedBy":    f.ModifiedBy.String(),
-		"sequence":      f.Sequence,
-		"numBlocks":     len(f.Blocks),
-		"version":       jsonVersionVector(f.Version),
-		"localFlags":    f.LocalFlags,
-	})
+	m := fileIntfJSONMap(protocol.FileInfo(f))
+	m["numBlocks"] = len(f.Blocks)
+	return json.Marshal(m)
 }
 
-type jsonDBFileInfo db.FileInfoTruncated
+type jsonFileInfoTrunc db.FileInfoTruncated
 
-func (f jsonDBFileInfo) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
-		"name":          f.Name,
-		"type":          f.Type.String(),
-		"size":          f.Size,
-		"permissions":   fmt.Sprintf("%#o", f.Permissions),
-		"deleted":       f.Deleted,
-		"invalid":       db.FileInfoTruncated(f).IsInvalid(),
-		"ignored":       db.FileInfoTruncated(f).IsIgnored(),
-		"mustRescan":    db.FileInfoTruncated(f).MustRescan(),
-		"noPermissions": f.NoPermissions,
-		"modified":      db.FileInfoTruncated(f).ModTime(),
-		"modifiedBy":    f.ModifiedBy.String(),
-		"sequence":      f.Sequence,
-		"numBlocks":     nil, // explicitly unknown
-		"version":       jsonVersionVector(f.Version),
-		"localFlags":    f.LocalFlags,
-	})
+func (f jsonFileInfoTrunc) MarshalJSON() ([]byte, error) {
+	m := fileIntfJSONMap(db.FileInfoTruncated(f))
+	m["numBlocks"] = nil // explicitly unknown
+	return json.Marshal(m)
+}
+
+func fileIntfJSONMap(f db.FileIntf) map[string]interface{} {
+	out := map[string]interface{}{
+		"name":          f.FileName(),
+		"type":          f.FileType().String(),
+		"size":          f.FileSize(),
+		"deleted":       f.IsDeleted(),
+		"invalid":       f.IsInvalid(),
+		"ignored":       f.IsIgnored(),
+		"mustRescan":    f.MustRescan(),
+		"noPermissions": !f.HasPermissionBits(),
+		"modified":      f.ModTime(),
+		"modifiedBy":    f.FileModifiedBy().String(),
+		"sequence":      f.SequenceNo(),
+		"version":       jsonVersionVector(f.FileVersion()),
+		"localFlags":    f.FileLocalFlags(),
+	}
+	if f.HasPermissionBits() {
+		out["permissions"] = fmt.Sprintf("%#o", f.FilePermissions())
+	}
+	return out
 }
 
 type jsonVersionVector protocol.Vector
@@ -1677,4 +1697,46 @@ func addressIsLocalhost(addr string) bool {
 		}
 		return ip.IsLoopback()
 	}
+}
+
+func checkExpiry(cert tls.Certificate) error {
+	leaf := cert.Leaf
+	if leaf == nil {
+		// Leaf can be nil or not, depending on how parsed the certificate
+		// was when we got it.
+		if len(cert.Certificate) < 1 {
+			// can't happen
+			return errors.New("no certificate in certificate")
+		}
+		var err error
+		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return err
+		}
+	}
+
+	if leaf.Subject.String() != leaf.Issuer.String() ||
+		len(leaf.DNSNames) != 0 || len(leaf.IPAddresses) != 0 {
+		// The certificate is not self signed, or has DNS/IP attributes we don't
+		// add, so we leave it alone.
+		return nil
+	}
+
+	if leaf.NotAfter.Before(time.Now()) {
+		return errors.New("certificate has expired")
+	}
+	if leaf.NotAfter.Before(time.Now().Add(30 * 24 * time.Hour)) {
+		return errors.New("certificate will soon expire")
+	}
+
+	// On macOS, check for certificates issued on or after July 1st, 2019,
+	// with a longer validity time than 825 days.
+	cutoff := time.Date(2019, 7, 1, 0, 0, 0, 0, time.UTC)
+	if runtime.GOOS == "darwin" &&
+		leaf.NotBefore.After(cutoff) &&
+		leaf.NotAfter.Sub(leaf.NotBefore) > 825*24*time.Hour {
+		return errors.New("certificate incompatible with macOS 10.15 (Catalina)")
+	}
+
+	return nil
 }
