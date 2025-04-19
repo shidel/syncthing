@@ -19,8 +19,11 @@ const (
 	FolderIdle folderState = iota
 	FolderScanning
 	FolderScanWaiting
+	FolderSyncWaiting
 	FolderSyncPreparing
 	FolderSyncing
+	FolderCleaning
+	FolderCleanWaiting
 	FolderError
 )
 
@@ -32,15 +35,49 @@ func (s folderState) String() string {
 		return "scanning"
 	case FolderScanWaiting:
 		return "scan-waiting"
+	case FolderSyncWaiting:
+		return "sync-waiting"
 	case FolderSyncPreparing:
 		return "sync-preparing"
 	case FolderSyncing:
 		return "syncing"
+	case FolderCleaning:
+		return "cleaning"
+	case FolderCleanWaiting:
+		return "clean-waiting"
 	case FolderError:
 		return "error"
 	default:
 		return "unknown"
 	}
+}
+
+type remoteFolderState int
+
+const (
+	remoteFolderUnknown remoteFolderState = iota
+	remoteFolderNotSharing
+	remoteFolderPaused
+	remoteFolderValid
+)
+
+func (s remoteFolderState) String() string {
+	switch s {
+	case remoteFolderUnknown:
+		return "unknown"
+	case remoteFolderNotSharing:
+		return "notSharing"
+	case remoteFolderPaused:
+		return "paused"
+	case remoteFolderValid:
+		return "valid"
+	default:
+		return "unknown"
+	}
+}
+
+func (s remoteFolderState) MarshalText() ([]byte, error) {
+	return []byte(s.String()), nil
 }
 
 type stateTracker struct {
@@ -74,6 +111,10 @@ func (s *stateTracker) setState(newState folderState) {
 		return
 	}
 
+	defer func() {
+		metricFolderState.WithLabelValues(s.folderID).Set(float64(s.current))
+	}()
+
 	/* This should hold later...
 	if s.current != FolderIdle && (newState == FolderScanning || newState == FolderSyncing) {
 		panic("illegal state transition " + s.current.String() + " -> " + newState.String())
@@ -91,7 +132,7 @@ func (s *stateTracker) setState(newState folderState) {
 	}
 
 	s.current = newState
-	s.changed = time.Now()
+	s.changed = time.Now().Truncate(time.Second)
 
 	s.evLogger.Log(events.StateChanged, eventData)
 }
@@ -110,6 +151,10 @@ func (s *stateTracker) getState() (current folderState, changed time.Time, err e
 func (s *stateTracker) setError(err error) {
 	s.mut.Lock()
 	defer s.mut.Unlock()
+
+	defer func() {
+		metricFolderState.WithLabelValues(s.folderID).Set(float64(s.current))
+	}()
 
 	eventData := map[string]interface{}{
 		"folder": s.folderID,
@@ -130,7 +175,7 @@ func (s *stateTracker) setError(err error) {
 	}
 
 	s.err = err
-	s.changed = time.Now()
+	s.changed = time.Now().Truncate(time.Second)
 
 	s.evLogger.Log(events.StateChanged, eventData)
 }

@@ -4,14 +4,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// +build !windows,!linux android
+//go:build (!windows && !linux && !ios) || android
+// +build !windows,!linux,!ios android
 
 package osutil
 
 import (
+	"fmt"
 	"syscall"
-
-	"github.com/pkg/errors"
 )
 
 // SetLowPriority lowers the process CPU scheduling priority, and possibly
@@ -29,6 +29,8 @@ func SetLowPriority() error {
 		return nil
 	}
 
-	err := syscall.Setpriority(syscall.PRIO_PROCESS, pidSelf, wantNiceLevel)
-	return errors.Wrap(err, "set niceness") // wraps nil as nil
+	if err := syscall.Setpriority(syscall.PRIO_PROCESS, pidSelf, wantNiceLevel); err != nil {
+		return fmt.Errorf("set niceness: %w", err)
+	}
+	return nil
 }

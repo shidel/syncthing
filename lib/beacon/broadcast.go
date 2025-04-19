@@ -41,20 +41,34 @@ func writeBroadcasts(ctx context.Context, inbox <-chan []byte, port int) error {
 		select {
 		case bs = <-inbox:
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		}
 
-		addrs, err := net.InterfaceAddrs()
+		intfs, err := net.Interfaces()
 		if err != nil {
-			l.Debugln(err)
-			return err
+			l.Debugln("Failed to list interfaces:", err)
+			// net.Interfaces() is broken on Android. see https://github.com/golang/go/issues/40569
+			// Use the general broadcast address 255.255.255.255 instead.
 		}
 
 		var dsts []net.IP
-		for _, addr := range addrs {
-			if iaddr, ok := addr.(*net.IPNet); ok && len(iaddr.IP) >= 4 && iaddr.IP.IsGlobalUnicast() && iaddr.IP.To4() != nil {
-				baddr := bcast(iaddr)
-				dsts = append(dsts, baddr.IP)
+		for _, intf := range intfs {
+			if intf.Flags&net.FlagRunning == 0 || intf.Flags&net.FlagBroadcast == 0 {
+				continue
+			}
+
+			addrs, err := intf.Addrs()
+			if err != nil {
+				l.Debugln("Failed to list interface addresses:", err)
+				// Interface discovery might work while retrieving the addresses doesn't. So log the error and carry on.
+				continue
+			}
+
+			for _, addr := range addrs {
+				if iaddr, ok := addr.(*net.IPNet); ok && len(iaddr.IP) >= 4 && iaddr.IP.IsGlobalUnicast() && iaddr.IP.To4() != nil {
+					baddr := bcast(iaddr)
+					dsts = append(dsts, baddr.IP)
+				}
 			}
 		}
 
@@ -91,7 +105,7 @@ func writeBroadcasts(ctx context.Context, inbox <-chan []byte, port int) error {
 		}
 
 		if success == 0 {
-			l.Debugln("couldn't send any braodcasts")
+			l.Debugln("couldn't send any broadcasts")
 			return err
 		}
 	}
@@ -126,7 +140,7 @@ func readBroadcasts(ctx context.Context, outbox chan<- recv, port int) error {
 		select {
 		case outbox <- recv{c, addr}:
 		case <-doneCtx.Done():
-			return nil
+			return doneCtx.Err()
 		default:
 			l.Debugln("dropping message")
 		}
@@ -134,7 +148,7 @@ func readBroadcasts(ctx context.Context, outbox chan<- recv, port int) error {
 }
 
 func bcast(ip *net.IPNet) *net.IPNet {
-	var bc = &net.IPNet{}
+	bc := &net.IPNet{}
 	bc.IP = make([]byte, len(ip.IP))
 	copy(bc.IP, ip.IP)
 	bc.Mask = ip.Mask

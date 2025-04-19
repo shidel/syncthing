@@ -7,6 +7,8 @@
 package versioner
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -14,15 +16,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/stringutil"
 )
 
-var errDirectory = fmt.Errorf("cannot restore on top of a directory")
-var errNotFound = fmt.Errorf("version not found")
-var errFileAlreadyExists = fmt.Errorf("file already exists")
+var (
+	ErrDirectory         = errors.New("cannot restore on top of a directory")
+	errNotFound          = errors.New("version not found")
+	errFileAlreadyExists = errors.New("file already exists")
+)
+
+const (
+	DefaultPath = ".stversions"
+)
 
 // TagFilename inserts ~tag just before the extension of the filename.
 func TagFilename(name, tag string) string {
@@ -118,7 +126,6 @@ func retrieveVersions(fileSystem fs.Filesystem) (map[string][]FileVersion, error
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +135,7 @@ func retrieveVersions(fileSystem fs.Filesystem) (map[string][]FileVersion, error
 
 type fileTagger func(string, string) string
 
-func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger) error {
+func archiveFile(method fs.CopyRangeMethod, srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger) error {
 	filePath = osutil.NativeFilename(filePath)
 	info, err := srcFs.Lstat(filePath)
 	if fs.IsNotExist(err) {
@@ -145,7 +152,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	if err != nil {
 		if fs.IsNotExist(err) {
 			l.Debugln("creating versions dir")
-			err := dstFs.Mkdir(".", 0755)
+			err := dstFs.MkdirAll(".", 0o755)
 			if err != nil {
 				return err
 			}
@@ -158,7 +165,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	file := filepath.Base(filePath)
 	inFolderPath := filepath.Dir(filePath)
 
-	err = dstFs.MkdirAll(inFolderPath, 0755)
+	err = dstFs.MkdirAll(inFolderPath, 0o755)
 	if err != nil && !fs.IsExist(err) {
 		l.Debugln("archiving", filePath, err)
 		return err
@@ -169,7 +176,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	ver := tagger(file, now.Format(TimeFormat))
 	dst := filepath.Join(inFolderPath, ver)
 	l.Debugln("archiving", filePath, "moving to", dst)
-	err = osutil.RenameOrCopy(srcFs, dstFs, filePath, dst)
+	err = osutil.RenameOrCopy(method, srcFs, dstFs, filePath, dst)
 
 	mtime := info.ModTime()
 	// If it's a trashcan versioner type thing, then it does not have version time in the name
@@ -183,7 +190,7 @@ func archiveFile(srcFs, dstFs fs.Filesystem, filePath string, tagger fileTagger)
 	return err
 }
 
-func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time, tagger fileTagger) error {
+func restoreFile(method fs.CopyRangeMethod, src, dst fs.Filesystem, filePath string, versionTime time.Time, tagger fileTagger) error {
 	tag := versionTime.In(time.Local).Truncate(time.Second).Format(TimeFormat)
 	taggedFilePath := tagger(filePath, tag)
 
@@ -192,15 +199,15 @@ func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time,
 	if info, err := dst.Lstat(filePath); err == nil {
 		switch {
 		case info.IsDir():
-			return errDirectory
+			return ErrDirectory
 		case info.IsSymlink():
 			// Remove existing symlinks (as we don't want to archive them)
 			if err := dst.Remove(filePath); err != nil {
-				return errors.Wrap(err, "removing existing symlink")
+				return fmt.Errorf("removing existing symlink: %w", err)
 			}
 		case info.IsRegular():
-			if err := archiveFile(dst, src, filePath, tagger); err != nil {
-				return errors.Wrap(err, "archiving existing file")
+			if err := archiveFile(method, dst, src, filePath, tagger); err != nil {
+				return fmt.Errorf("archiving existing file: %w", err)
 			}
 		default:
 			panic("bug: unknown item type")
@@ -245,28 +252,32 @@ func restoreFile(src, dst fs.Filesystem, filePath string, versionTime time.Time,
 		return err
 	}
 
-	_ = dst.MkdirAll(filepath.Dir(filePath), 0755)
-	err := osutil.RenameOrCopy(src, dst, sourceFile, filePath)
+	_ = dst.MkdirAll(filepath.Dir(filePath), 0o755)
+	err := osutil.RenameOrCopy(method, src, dst, sourceFile, filePath)
 	_ = dst.Chtimes(filePath, sourceMtime, sourceMtime)
 	return err
 }
 
-func fsFromParams(folderFs fs.Filesystem, params map[string]string) (versionsFs fs.Filesystem) {
-	if params["fsType"] == "" && params["fsPath"] == "" {
-		versionsFs = fs.NewFilesystem(folderFs.Type(), filepath.Join(folderFs.URI(), ".stversions"))
-
-	} else if params["fsType"] == "" {
-		uri := params["fsPath"]
-		// We only know how to deal with relative folders for basic filesystems, as that's the only one we know
-		// how to check if it's absolute or relative.
-		if folderFs.Type() == fs.FilesystemTypeBasic && !filepath.IsAbs(params["fsPath"]) {
-			uri = filepath.Join(folderFs.URI(), params["fsPath"])
+func versionerFsFromFolderCfg(cfg config.FolderConfiguration) (versionsFs fs.Filesystem) {
+	folderFs := cfg.Filesystem(nil)
+	if cfg.Versioning.FSPath == "" {
+		versionsFs = fs.NewFilesystem(folderFs.Type(), filepath.Join(folderFs.URI(), DefaultPath))
+	} else if cfg.Versioning.FSType == config.FilesystemTypeBasic {
+		// Expand any leading tildes for basic filesystems,
+		// before checking for absolute paths.
+		path, err := fs.ExpandTilde(cfg.Versioning.FSPath)
+		if err != nil {
+			path = cfg.Versioning.FSPath
 		}
-		versionsFs = fs.NewFilesystem(folderFs.Type(), uri)
+		// We only know how to deal with relative folders for
+		// basic filesystems, as that's the only one we know
+		// how to check if it's absolute or relative.
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(folderFs.URI(), path)
+		}
+		versionsFs = fs.NewFilesystem(cfg.Versioning.FSType.ToFS(), path)
 	} else {
-		var fsType fs.FilesystemType
-		_ = fsType.UnmarshalText([]byte(params["fsType"]))
-		versionsFs = fs.NewFilesystem(fsType, params["fsPath"])
+		versionsFs = fs.NewFilesystem(cfg.Versioning.FSType.ToFS(), cfg.Versioning.FSPath)
 	}
 	l.Debugf("%s (%s) folder using %s (%s) versioner dir", folderFs.URI(), folderFs.Type(), versionsFs.URI(), versionsFs.Type())
 	return
@@ -283,8 +294,78 @@ func findAllVersions(fs fs.Filesystem, filePath string) []string {
 		l.Warnln("globbing:", err, "for", pattern)
 		return nil
 	}
-	versions = util.UniqueTrimmedStrings(versions)
+	versions = stringutil.UniqueTrimmedStrings(versions)
 	sort.Strings(versions)
 
 	return versions
+}
+
+func clean(ctx context.Context, versionsFs fs.Filesystem, toRemove func([]string, time.Time) []string) error {
+	l.Debugln("Versioner clean: Cleaning", versionsFs)
+
+	if _, err := versionsFs.Stat("."); fs.IsNotExist(err) {
+		// There is no need to clean a nonexistent dir.
+		return nil
+	}
+
+	versionsPerFile := make(map[string][]string)
+	dirTracker := make(emptyDirTracker)
+
+	walkFn := func(path string, f fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if f.IsDir() && !f.IsSymlink() {
+			dirTracker.addDir(path)
+			return nil
+		}
+
+		// Regular file, or possibly a symlink.
+		dirTracker.addFile(path)
+
+		name, _ := UntagFilename(path)
+		if name == "" {
+			return nil
+		}
+
+		versionsPerFile[name] = append(versionsPerFile[name], path)
+
+		return nil
+	}
+
+	if err := versionsFs.Walk(".", walkFn); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			l.Warnln("Versioner: scanning versions dir:", err)
+		}
+		return err
+	}
+
+	for _, versionList := range versionsPerFile {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		cleanVersions(versionsFs, versionList, toRemove)
+	}
+
+	dirTracker.deleteEmptyDirs(versionsFs)
+
+	l.Debugln("Cleaner: Finished cleaning", versionsFs)
+	return nil
+}
+
+func cleanVersions(versionsFs fs.Filesystem, versions []string, toRemove func([]string, time.Time) []string) {
+	l.Debugln("Versioner: Expiring versions", versions)
+	for _, file := range toRemove(versions, time.Now()) {
+		if err := versionsFs.Remove(file); err != nil {
+			l.Warnf("Versioner: can't remove %q: %v", file, err)
+		}
+	}
 }

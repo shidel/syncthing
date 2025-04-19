@@ -15,17 +15,16 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/osutil"
-	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/svcutil"
 	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/syncthing"
 )
 
 var (
@@ -35,51 +34,63 @@ var (
 )
 
 const (
-	countRestarts         = 4
-	loopThreshold         = 60 * time.Second
+	restartCounts         = 4
+	restartPause          = 1 * time.Second
+	restartLoopThreshold  = 60 * time.Second
 	logFileAutoCloseDelay = 5 * time.Second
 	logFileMaxOpenTime    = time.Minute
 	panicUploadMaxWait    = 30 * time.Second
 	panicUploadNoticeWait = 10 * time.Second
 )
 
-func monitorMain(runtimeOptions RuntimeOptions) {
+func monitorMain(options serveOptions) {
 	l.SetPrefix("[monitor] ")
 
 	var dst io.Writer = os.Stdout
 
-	logFile := runtimeOptions.logFile
+	logFile := locations.Get(locations.LogFile)
 	if logFile != "-" {
+		if expanded, err := fs.ExpandTilde(logFile); err == nil {
+			logFile = expanded
+		}
 		var fileDst io.Writer
-		if runtimeOptions.logMaxSize > 0 {
-			open := func(name string) (io.WriteCloser, error) {
-				return newAutoclosedFile(name, logFileAutoCloseDelay, logFileMaxOpenTime), nil
-			}
-			fileDst = newRotatedFile(logFile, open, int64(runtimeOptions.logMaxSize), runtimeOptions.logMaxFiles)
+		var err error
+		open := func(name string) (io.WriteCloser, error) {
+			return newAutoclosedFile(name, logFileAutoCloseDelay, logFileMaxOpenTime)
+		}
+		if options.LogMaxSize > 0 {
+			fileDst, err = newRotatedFile(logFile, open, int64(options.LogMaxSize), options.LogMaxFiles)
 		} else {
-			fileDst = newAutoclosedFile(logFile, logFileAutoCloseDelay, logFileMaxOpenTime)
+			fileDst, err = open(logFile)
 		}
-
-		if runtime.GOOS == "windows" {
-			// Translate line breaks to Windows standard
-			fileDst = osutil.ReplacingWriter{
-				Writer: fileDst,
-				From:   '\n',
-				To:     []byte{'\r', '\n'},
+		if err != nil {
+			l.Warnln("Failed to set up logging to file, proceeding with logging to stdout only:", err)
+		} else {
+			if build.IsWindows {
+				// Translate line breaks to Windows standard
+				fileDst = osutil.ReplacingWriter{
+					Writer: fileDst,
+					From:   '\n',
+					To:     []byte{'\r', '\n'},
+				}
 			}
+
+			// Log to both stdout and file.
+			dst = io.MultiWriter(dst, fileDst)
+
+			l.Infof(`Log output saved to file "%s"`, logFile)
 		}
-
-		// Log to both stdout and file.
-		dst = io.MultiWriter(dst, fileDst)
-
-		l.Infof(`Log output saved to file "%s"`, logFile)
 	}
 
 	args := os.Args
-	var restarts [countRestarts]time.Time
+	binary, err := getBinary(args[0])
+	if err != nil {
+		l.Warnln("Error starting the main Syncthing process:", err)
+		panic("Error starting the main Syncthing process")
+	}
+	var restarts [restartCounts]time.Time
 
 	stopSign := make(chan os.Signal, 1)
-	sigTerm := syscall.Signal(15)
 	signal.Notify(stopSign, os.Interrupt, sigTerm)
 	restartSign := make(chan os.Signal, 1)
 	sigHup := syscall.Signal(1)
@@ -90,15 +101,15 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 	for {
 		maybeReportPanics()
 
-		if t := time.Since(restarts[0]); t < loopThreshold {
-			l.Warnf("%d restarts in %v; not retrying further", countRestarts, t)
-			os.Exit(syncthing.ExitError.AsInt())
+		if t := time.Since(restarts[0]); t < restartLoopThreshold {
+			l.Warnf("%d restarts in %v; not retrying further", restartCounts, t)
+			os.Exit(svcutil.ExitError.AsInt())
 		}
 
 		copy(restarts[0:], restarts[1:])
 		restarts[len(restarts)-1] = time.Now()
 
-		cmd := exec.Command(args[0], args[1:]...)
+		cmd := exec.Command(binary, args[1:]...)
 		cmd.Env = childEnv
 
 		stderr, err := cmd.StderrPipe()
@@ -111,7 +122,7 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 			panic(err)
 		}
 
-		l.Infoln("Starting syncthing")
+		l.Debugln("Starting syncthing")
 		err = cmd.Start()
 		if err != nil {
 			l.Warnln("Error starting the main Syncthing process:", err)
@@ -144,12 +155,13 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 			exit <- cmd.Wait()
 		}()
 
+		stopped := false
 		select {
 		case s := <-stopSign:
 			l.Infof("Signal %d received; exiting", s)
 			cmd.Process.Signal(sigTerm)
-			<-exit
-			return
+			err = <-exit
+			stopped = true
 
 		case s := <-restartSign:
 			l.Infof("Signal %d received; restarting", s)
@@ -157,24 +169,35 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 			err = <-exit
 
 		case err = <-exit:
-			if err == nil {
-				// Successful exit indicates an intentional shutdown
-				return
-			} else if exiterr, ok := err.(*exec.ExitError); ok {
-				if exiterr.ExitCode() == syncthing.ExitUpgrade.AsInt() {
-					// Restart the monitor process to release the .old
-					// binary as part of the upgrade process.
-					l.Infoln("Restarting monitor...")
-					if err = restartMonitor(args); err != nil {
-						l.Warnln("Restart:", err)
-					}
-					return
+		}
+
+		if err == nil {
+			// Successful exit indicates an intentional shutdown
+			os.Exit(svcutil.ExitSuccess.AsInt())
+		}
+
+		if exiterr, ok := err.(*exec.ExitError); ok {
+			exitCode := exiterr.ExitCode()
+			if stopped || options.NoRestart {
+				os.Exit(exitCode)
+			}
+			if exitCode == svcutil.ExitUpgrade.AsInt() {
+				// Restart the monitor process to release the .old
+				// binary as part of the upgrade process.
+				l.Infoln("Restarting monitor...")
+				if err = restartMonitor(binary, args); err != nil {
+					l.Warnln("Restart:", err)
 				}
+				os.Exit(exitCode)
 			}
 		}
 
+		if options.NoRestart {
+			os.Exit(svcutil.ExitError.AsInt())
+		}
+
 		l.Infoln("Syncthing exited:", err)
-		time.Sleep(1 * time.Second)
+		time.Sleep(restartPause)
 
 		if first {
 			// Let the next child process know that this is not the first time
@@ -183,6 +206,19 @@ func monitorMain(runtimeOptions RuntimeOptions) {
 			first = false
 		}
 	}
+}
+
+func getBinary(args0 string) (string, error) {
+	e, err := os.Executable()
+	if err == nil {
+		return e, nil
+	}
+	// Check if args0 cuts it
+	e, lerr := exec.LookPath(args0)
+	if lerr == nil {
+		return e, nil
+	}
+	return "", err
 }
 
 func copyStderr(stderr io.Reader, dst io.Writer) {
@@ -205,22 +241,6 @@ func copyStderr(stderr io.Reader, dst io.Writer) {
 		if panicFd == nil {
 			dst.Write([]byte(line))
 
-			if strings.Contains(line, "SIGILL") {
-				l.Warnln(`
-*******************************************************************************
-* Crash due to illegal instruction detected. This is most likely due to a CPU *
-* incompatibility with the high performance hashing package. Switching to the *
-* standard hashing package instead. Please report this issue at:              *
-*                                                                             *
-*   https://github.com/syncthing/syncthing/issues                             *
-*                                                                             *
-* Include the details of your CPU.                                            *
-*******************************************************************************
-`)
-				os.Setenv("STHASHING", "standard")
-				return
-			}
-
 			if strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") {
 				panicFd, err = os.Create(locations.GetTimestamped(locations.PanicLog))
 				if err != nil {
@@ -237,7 +257,7 @@ func copyStderr(stderr io.Reader, dst io.Writer) {
 * This crash usually occurs due to one of the following reasons:                *
 *  - Syncthing being stopped abruptly (killed/loss of power)                    *
 *  - Bad hardware (memory/disk issues)                                          *
-*  - Software that affects disk writes (SSD caching software and simillar)      *
+*  - Software that affects disk writes (SSD caching software and similar)       *
 *                                                                               *
 * Please see the following URL for instructions on how to recover:              *
 *   https://docs.syncthing.net/users/faq.html#my-syncthing-database-is-corrupt  *
@@ -291,35 +311,30 @@ func copyStdout(stdout io.Reader, dst io.Writer) {
 	}
 }
 
-func restartMonitor(args []string) error {
-	if runtime.GOOS != "windows" {
+func restartMonitor(binary string, args []string) error {
+	// Set the STRESTART environment variable to indicate to the next
+	// process that this is a restart and not initial start. This prevents
+	// opening the browser on startup.
+	os.Setenv("STRESTART", "yes")
+
+	if !build.IsWindows {
 		// syscall.Exec is the cleanest way to restart on Unixes as it
 		// replaces the current process with the new one, keeping the pid and
 		// controlling terminal and so on
-		return restartMonitorUnix(args)
+		return restartMonitorUnix(binary, args)
 	}
 
 	// but it isn't supported on Windows, so there we start a normal
 	// exec.Command and return.
-	return restartMonitorWindows(args)
+	return restartMonitorWindows(binary, args)
 }
 
-func restartMonitorUnix(args []string) error {
-	if !strings.ContainsRune(args[0], os.PathSeparator) {
-		// The path to the binary doesn't contain a slash, so it should be
-		// found in $PATH.
-		binary, err := exec.LookPath(args[0])
-		if err != nil {
-			return err
-		}
-		args[0] = binary
-	}
-
-	return syscall.Exec(args[0], args, os.Environ())
+func restartMonitorUnix(binary string, args []string) error {
+	return syscall.Exec(binary, args, os.Environ())
 }
 
-func restartMonitorWindows(args []string) error {
-	cmd := exec.Command(args[0], args[1:]...)
+func restartMonitorWindows(binary string, args []string) error {
+	cmd := exec.Command(binary, args[1:]...)
 	// Retain the standard streams
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
@@ -338,16 +353,30 @@ type rotatedFile struct {
 	currentSize int64
 }
 
-// the createFn should act equivalently to os.Create
 type createFn func(name string) (io.WriteCloser, error)
 
-func newRotatedFile(name string, create createFn, maxSize int64, maxFiles int) *rotatedFile {
-	return &rotatedFile{
-		name:     name,
-		create:   create,
-		maxSize:  maxSize,
-		maxFiles: maxFiles,
+func newRotatedFile(name string, create createFn, maxSize int64, maxFiles int) (*rotatedFile, error) {
+	var size int64
+	if info, err := os.Lstat(name); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		size = 0
+	} else {
+		size = info.Size()
 	}
+	writer, err := create(name)
+	if err != nil {
+		return nil, err
+	}
+	return &rotatedFile{
+		name:        name,
+		create:      create,
+		maxSize:     maxSize,
+		maxFiles:    maxFiles,
+		currentFile: writer,
+		currentSize: size,
+	}, nil
 }
 
 func (r *rotatedFile) Write(bs []byte) (int, error) {
@@ -355,19 +384,13 @@ func (r *rotatedFile) Write(bs []byte) (int, error) {
 	// file so we'll start on a new one.
 	if r.currentSize+int64(len(bs)) > r.maxSize {
 		r.currentFile.Close()
-		r.currentFile = nil
 		r.currentSize = 0
-	}
-
-	// If we have no current log, rotate old files out of the way and create
-	// a new one.
-	if r.currentFile == nil {
 		r.rotate()
-		fd, err := r.create(r.name)
+		f, err := r.create(r.name)
 		if err != nil {
 			return 0, err
 		}
-		r.currentFile = fd
+		r.currentFile = f
 	}
 
 	n, err := r.currentFile.Write(bs)
@@ -420,7 +443,7 @@ type autoclosedFile struct {
 	mut sync.Mutex
 }
 
-func newAutoclosedFile(name string, closeDelay, maxOpenTime time.Duration) *autoclosedFile {
+func newAutoclosedFile(name string, closeDelay, maxOpenTime time.Duration) (*autoclosedFile, error) {
 	f := &autoclosedFile{
 		name:        name,
 		closeDelay:  closeDelay,
@@ -429,8 +452,13 @@ func newAutoclosedFile(name string, closeDelay, maxOpenTime time.Duration) *auto
 		closed:      make(chan struct{}),
 		closeTimer:  time.NewTimer(time.Minute),
 	}
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	if err := f.ensureOpenLocked(); err != nil {
+		return nil, err
+	}
 	go f.closerLoop()
-	return f
+	return f, nil
 }
 
 func (f *autoclosedFile) Write(bs []byte) (int, error) {
@@ -438,7 +466,7 @@ func (f *autoclosedFile) Write(bs []byte) (int, error) {
 	defer f.mut.Unlock()
 
 	// Make sure the file is open for appending
-	if err := f.ensureOpen(); err != nil {
+	if err := f.ensureOpenLocked(); err != nil {
 		return 0, err
 	}
 
@@ -468,24 +496,16 @@ func (f *autoclosedFile) Close() error {
 }
 
 // Must be called with f.mut held!
-func (f *autoclosedFile) ensureOpen() error {
+func (f *autoclosedFile) ensureOpenLocked() error {
 	if f.fd != nil {
 		// File is already open
 		return nil
 	}
 
 	// We open the file for write only, and create it if it doesn't exist.
-	flags := os.O_WRONLY | os.O_CREATE
-	if f.opened.IsZero() {
-		// This is the first time we are opening the file. We should truncate
-		// it to better emulate an os.Create() call.
-		flags |= os.O_TRUNC
-	} else {
-		// The file was already opened once, so we should append to it.
-		flags |= os.O_APPEND
-	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
 
-	fd, err := os.OpenFile(f.name, flags, 0644)
+	fd, err := os.OpenFile(f.name, flags, 0o644)
 	if err != nil {
 		return err
 	}
@@ -534,7 +554,7 @@ func childEnv() []string {
 // panicUploadMaxWait uploading panics...
 func maybeReportPanics() {
 	// Try to get a config to see if/where panics should be reported.
-	cfg, err := loadOrDefaultConfig(protocol.EmptyDeviceID, events.NoopLogger)
+	cfg, err := loadOrDefaultConfig()
 	if err != nil {
 		l.Warnln("Couldn't load config; not reporting crash")
 		return

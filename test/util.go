@@ -4,17 +4,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
 
 import (
-	"crypto/md5"
 	cr "crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -26,6 +26,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/rc"
 )
 
@@ -41,6 +42,10 @@ const (
 )
 
 func generateFiles(dir string, files, maxexp int, srcname string) error {
+	return generateFilesWithTime(dir, files, maxexp, srcname, time.Now())
+}
+
+func generateFilesWithTime(dir string, files, maxexp int, srcname string, t0 time.Time) error {
 	fd, err := os.Open(srcname)
 	if err != nil {
 		return err
@@ -55,7 +60,7 @@ func generateFiles(dir string, files, maxexp int, srcname string) error {
 		}
 
 		p0 := filepath.Join(dir, string(n[0]), n[0:2])
-		err = os.MkdirAll(p0, 0755)
+		err = os.MkdirAll(p0, 0o755)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -69,7 +74,7 @@ func generateFiles(dir string, files, maxexp int, srcname string) error {
 		}
 		s += rand.Int63n(a)
 
-		if err := generateOneFile(fd, p1, s); err != nil {
+		if err := generateOneFile(fd, p1, s, t0); err != nil {
 			return err
 		}
 	}
@@ -77,8 +82,8 @@ func generateFiles(dir string, files, maxexp int, srcname string) error {
 	return nil
 }
 
-func generateOneFile(fd io.ReadSeeker, p1 string, s int64) error {
-	src := io.LimitReader(&inifiteReader{fd}, int64(s))
+func generateOneFile(fd io.ReadSeeker, p1 string, s int64, t0 time.Time) error {
+	src := io.LimitReader(&infiniteReader{fd}, int64(s))
 	dst, err := os.Create(p1)
 	if err != nil {
 		return err
@@ -94,9 +99,9 @@ func generateOneFile(fd io.ReadSeeker, p1 string, s int64) error {
 		return err
 	}
 
-	os.Chmod(p1, os.FileMode(rand.Intn(0777)|0400))
+	os.Chmod(p1, os.FileMode(rand.Intn(0o777)|0o400))
 
-	t := time.Now().Add(-time.Duration(rand.Intn(30*86400)) * time.Second)
+	t := t0.Add(-time.Duration(rand.Intn(30*86400)) * time.Second)
 	err = os.Chtimes(p1, t, t)
 	if err != nil {
 		return err
@@ -144,15 +149,15 @@ func alterFiles(dir string) error {
 			return removeAll(path)
 
 		case r == 1 && info.Mode().IsRegular():
-			if info.Mode()&0200 != 0200 {
+			if info.Mode()&0o200 != 0o200 {
 				// Not owner writable. Fix.
-				if err = os.Chmod(path, 0644); err != nil {
+				if err = os.Chmod(path, 0o644); err != nil {
 					return err
 				}
 			}
 
 			// Overwrite a random kilobyte of every tenth file
-			fd, err := os.OpenFile(path, os.O_RDWR, 0644)
+			fd, err := os.OpenFile(path, os.O_RDWR, 0o644)
 			if err != nil {
 				return err
 			}
@@ -170,7 +175,7 @@ func alterFiles(dir string) error {
 
 		// Change capitalization
 		case r == 2 && comps > 3 && rand.Float64() < 0.2:
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if build.IsDarwin || build.IsWindows {
 				// Syncthing is currently broken for case-only renames on case-
 				// insensitive platforms.
 				// https://github.com/syncthing/syncthing/issues/1787
@@ -201,7 +206,7 @@ func alterFiles(dir string) error {
 							return err
 						}
 						d1 := []byte("I used to be a dir: " + path)
-						err := ioutil.WriteFile(path, d1, 0644)
+						err := os.WriteFile(path, d1, 0644)
 						if err != nil {
 							return err
 						}
@@ -260,11 +265,11 @@ func randomName() string {
 	return fmt.Sprintf("%x", b[:])
 }
 
-type inifiteReader struct {
+type infiniteReader struct {
 	rd io.ReadSeeker
 }
 
-func (i *inifiteReader) Read(bs []byte) (int, error) {
+func (i *infiniteReader) Read(bs []byte) (int, error) {
 	n, err := i.rd.Read(bs)
 	if err == io.EOF {
 		err = nil
@@ -286,8 +291,8 @@ func removeAll(dirs ...string) error {
 				if err != nil {
 					return err
 				}
-				if info.Mode()&0700 != 0700 {
-					os.Chmod(path, 0777)
+				if info.Mode()&0o700 != 0o700 {
+					os.Chmod(path, 0o777)
 				}
 				return nil
 			})
@@ -330,7 +335,7 @@ func compareDirectories(dirs ...string) error {
 		for i := 1; i < len(res); i++ {
 			if res[i] != res[0] {
 				close(abort)
-				return fmt.Errorf("Mismatch; %#v (%s) != %#v (%s)", res[i], dirs[i], res[0], dirs[0])
+				return fmt.Errorf("mismatch; %#v (%s) != %#v (%s)", res[i], dirs[i], res[0], dirs[0])
 			}
 		}
 
@@ -381,7 +386,7 @@ func compareDirectoryContents(actual, expected []fileInfo) error {
 
 	for i := range actual {
 		if actual[i] != expected[i] {
-			return fmt.Errorf("Mismatch; actual %#v != expected %#v", actual[i], expected[i])
+			return fmt.Errorf("mismatch; actual %#v != expected %#v", actual[i], expected[i])
 		}
 	}
 	return nil
@@ -391,7 +396,7 @@ type fileInfo struct {
 	name string
 	mode os.FileMode
 	mod  int64
-	hash [16]byte
+	hash [sha256.Size]byte
 	size int64
 }
 
@@ -438,11 +443,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 			if err != nil {
 				return err
 			}
-			h := md5.New()
-			h.Write([]byte(tgt))
-			hash := h.Sum(nil)
-
-			copy(f.hash[:], hash)
+			f.hash = sha256.Sum256([]byte(tgt))
 		} else if info.IsDir() {
 			f = fileInfo{
 				name: rn,
@@ -459,7 +460,7 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 				mod:  info.ModTime().Unix(),
 				size: info.Size(),
 			}
-			sum, err := md5file(path)
+			sum, err := sha256file(path)
 			if err != nil {
 				return err
 			}
@@ -486,14 +487,14 @@ func startWalker(dir string, res chan<- fileInfo, abort <-chan struct{}) chan er
 	return errc
 }
 
-func md5file(fname string) (hash [16]byte, err error) {
+func sha256file(fname string) (hash [sha256.Size]byte, err error) {
 	f, err := os.Open(fname)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	h := md5.New()
+	h := sha256.New()
 	io.Copy(h, f)
 	hb := h.Sum(nil)
 	copy(hash[:], hb)
@@ -541,7 +542,7 @@ func startInstance(t *testing.T, i int) *rc.Process {
 
 	p := rc.NewProcess(addr)
 	p.LogTo(log)
-	if err := p.Start("../bin/syncthing", "-home", fmt.Sprintf("h%d", i), "-no-browser"); err != nil {
+	if err := p.Start("../bin/syncthing", "--home", fmt.Sprintf("h%d", i), "--no-browser"); err != nil {
 		t.Fatal(err)
 	}
 	p.AwaitStartup()
@@ -550,11 +551,27 @@ func startInstance(t *testing.T, i int) *rc.Process {
 }
 
 func symlinksSupported() bool {
-	tmp, err := ioutil.TempDir("", "symlink-test")
+	tmp, err := os.MkdirTemp("", "symlink-test")
 	if err != nil {
 		return false
 	}
 	defer os.RemoveAll(tmp)
 	err = os.Symlink("tmp", filepath.Join(tmp, "link"))
 	return err == nil
+}
+
+// checkRemoteInSync checks if the devices associated twith the given processes
+// are in sync according to the remote status on both sides.
+func checkRemoteInSync(folder string, p1, p2 *rc.Process) error {
+	if inSync, err := p1.RemoteInSync(folder, p2.ID()); err != nil {
+		return err
+	} else if !inSync {
+		return fmt.Errorf(`from device %v folder "%v" is not in sync on device %v`, p1.ID(), folder, p2.ID())
+	}
+	if inSync, err := p2.RemoteInSync(folder, p1.ID()); err != nil {
+		return err
+	} else if !inSync {
+		return fmt.Errorf(`from device %v folder "%v" is not in sync on device %v`, p2.ID(), folder, p1.ID())
+	}
+	return nil
 }

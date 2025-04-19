@@ -9,53 +9,50 @@ package syncthing
 import (
 	"context"
 	"fmt"
-
-	"github.com/thejerf/suture"
+	"regexp"
 
 	"github.com/syncthing/syncthing/lib/events"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/model"
 )
 
 // The verbose logging service subscribes to events and prints these in
 // verbose format to the console using INFO level.
 type verboseService struct {
-	suture.Service
-	sub events.Subscription
+	evLogger events.Logger
 }
 
 func newVerboseService(evLogger events.Logger) *verboseService {
-	s := &verboseService{
-		sub: evLogger.Subscribe(events.AllEvents),
+	return &verboseService{
+		evLogger: evLogger,
 	}
-	s.Service = util.AsService(s.serve, s.String())
-	return s
 }
 
 // serve runs the verbose logging service.
-func (s *verboseService) serve(ctx context.Context) {
+func (s *verboseService) Serve(ctx context.Context) error {
+	sub := s.evLogger.Subscribe(events.AllEvents)
+	defer sub.Unsubscribe()
 	for {
 		select {
-		case ev := <-s.sub.C():
+		case ev, ok := <-sub.C():
+			if !ok {
+				<-ctx.Done()
+				return ctx.Err()
+			}
 			formatted := s.formatEvent(ev)
 			if formatted != "" {
 				l.Verboseln(formatted)
 			}
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }
 
-// Stop stops the verbose logging service.
-func (s *verboseService) Stop() {
-	s.Service.Stop()
-	s.sub.Unsubscribe()
+var folderSummaryRemoveDeprecatedRe = regexp.MustCompile(`(Invalid|IgnorePatterns|StateChanged):\S+\s?`)
 
-}
-
-func (s *verboseService) formatEvent(ev events.Event) string {
+func (*verboseService) formatEvent(ev events.Event) string {
 	switch ev.Type {
-	case events.DownloadProgress, events.LocalIndexUpdated:
+	case events.DownloadProgress:
 		// Skip
 		return ""
 
@@ -89,9 +86,13 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 		data := ev.Data.(map[string]string)
 		return fmt.Sprintf("Remote change detected in folder %q: %s %s %s", data["folder"], data["action"], data["type"], data["path"])
 
+	case events.LocalIndexUpdated:
+		data := ev.Data.(map[string]interface{})
+		return fmt.Sprintf("Local index update for %q with %d items (seq: %d)", data["folder"], data["items"], data["sequence"])
+
 	case events.RemoteIndexUpdated:
 		data := ev.Data.(map[string]interface{})
-		return fmt.Sprintf("Device %v sent an index update for %q with %d items", data["device"], data["folder"], data["items"])
+		return fmt.Sprintf("Device %v sent an index update for %q with %d items (seq: %d)", data["device"], data["folder"], data["items"], data["sequence"])
 
 	case events.DeviceRejected:
 		data := ev.Data.(map[string]string)
@@ -120,18 +121,11 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 
 	case events.FolderCompletion:
 		data := ev.Data.(map[string]interface{})
-		return fmt.Sprintf("Completion for folder %q on device %v is %v%%", data["folder"], data["device"], data["completion"])
+		return fmt.Sprintf("Completion for folder %q on device %v is %v%% (state: %s, seq: %d)", data["folder"], data["device"], data["completion"], data["remoteState"], data["sequence"])
 
 	case events.FolderSummary:
-		data := ev.Data.(map[string]interface{})
-		sum := make(map[string]interface{})
-		for k, v := range data["summary"].(map[string]interface{}) {
-			if k == "invalid" || k == "ignorePatterns" || k == "stateChanged" {
-				continue
-			}
-			sum[k] = v
-		}
-		return fmt.Sprintf("Summary for folder %q is %v", data["folder"], sum)
+		data := ev.Data.(model.FolderSummaryEventData)
+		return folderSummaryRemoveDeprecatedRe.ReplaceAllString(fmt.Sprintf("Summary for folder %q is %+v", data.Folder, data.Summary), "")
 
 	case events.FolderScanProgress:
 		data := ev.Data.(map[string]interface{})
@@ -154,6 +148,10 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 		data := ev.Data.(map[string]string)
 		device := data["device"]
 		return fmt.Sprintf("Device %v was resumed", device)
+
+	case events.ClusterConfigReceived:
+		data := ev.Data.(model.ClusterConfigReceivedEventData)
+		return fmt.Sprintf("Received ClusterConfig from device %v", data.Device)
 
 	case events.FolderPaused:
 		data := ev.Data.(map[string]string)

@@ -8,11 +8,10 @@
 package osutil
 
 import (
-	"io"
 	"path/filepath"
-	"runtime"
 	"strings"
 
+	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/sync"
 )
@@ -24,7 +23,7 @@ var renameLock = sync.NewMutex()
 // RenameOrCopy renames a file, leaving source file intact in case of failure.
 // Tries hard to succeed on various systems by temporarily tweaking directory
 // permissions and removing the destination file when necessary.
-func RenameOrCopy(src, dst fs.Filesystem, from, to string) error {
+func RenameOrCopy(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to string) error {
 	renameLock.Lock()
 	defer renameLock.Unlock()
 
@@ -59,7 +58,7 @@ func RenameOrCopy(src, dst fs.Filesystem, from, to string) error {
 			}
 		}
 
-		err := copyFileContents(src, dst, from, to)
+		err := copyFileContents(method, src, dst, from, to)
 		if err != nil {
 			_ = dst.Remove(to)
 			return err
@@ -74,9 +73,9 @@ func RenameOrCopy(src, dst fs.Filesystem, from, to string) error {
 // Copy copies the file content from source to destination.
 // Tries hard to succeed on various systems by temporarily tweaking directory
 // permissions and removing the destination file when necessary.
-func Copy(src, dst fs.Filesystem, from, to string) (err error) {
+func Copy(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to string) error {
 	return withPreparedTarget(dst, from, to, func() error {
-		return copyFileContents(src, dst, from, to)
+		return copyFileContents(method, src, dst, from, to)
 	})
 }
 
@@ -85,14 +84,14 @@ func Copy(src, dst fs.Filesystem, from, to string) (err error) {
 func withPreparedTarget(filesystem fs.Filesystem, from, to string, f func() error) error {
 	// Make sure the destination directory is writeable
 	toDir := filepath.Dir(to)
-	if info, err := filesystem.Stat(toDir); err == nil && info.IsDir() && info.Mode()&0200 == 0 {
-		filesystem.Chmod(toDir, 0755)
+	if info, err := filesystem.Stat(toDir); err == nil && info.IsDir() && info.Mode()&0o200 == 0 {
+		filesystem.Chmod(toDir, 0o755)
 		defer filesystem.Chmod(toDir, info.Mode())
 	}
 
 	// On Windows, make sure the destination file is writeable (or we can't delete it)
-	if runtime.GOOS == "windows" {
-		filesystem.Chmod(to, 0666)
+	if build.IsWindows {
+		filesystem.Chmod(to, 0o666)
 		if !strings.EqualFold(from, to) {
 			err := filesystem.Remove(to)
 			if err != nil && !fs.IsNotExist(err) {
@@ -107,7 +106,7 @@ func withPreparedTarget(filesystem fs.Filesystem, from, to string, f func() erro
 // by dst. The file will be created if it does not already exist. If the
 // destination file exists, all its contents will be replaced by the contents
 // of the source file.
-func copyFileContents(srcFs, dstFs fs.Filesystem, src, dst string) (err error) {
+func copyFileContents(method fs.CopyRangeMethod, srcFs, dstFs fs.Filesystem, src, dst string) (err error) {
 	in, err := srcFs.Open(src)
 	if err != nil {
 		return
@@ -123,13 +122,19 @@ func copyFileContents(srcFs, dstFs fs.Filesystem, src, dst string) (err error) {
 			err = cerr
 		}
 	}()
-	_, err = io.Copy(out, in)
+	inFi, err := in.Stat()
+	if err != nil {
+		return
+	}
+	err = fs.CopyRange(method, in, out, 0, 0, inFi.Size())
 	return
 }
 
 func IsDeleted(ffs fs.Filesystem, name string) bool {
-	if _, err := ffs.Lstat(name); fs.IsNotExist(err) {
-		return true
+	if _, err := ffs.Lstat(name); err != nil {
+		if fs.IsNotExist(err) || fs.IsErrCaseConflict(err) {
+			return true
+		}
 	}
 	switch TraversesSymlink(ffs, filepath.Dir(name)).(type) {
 	case *NotADirectoryError, *TraversesSymlinkError:

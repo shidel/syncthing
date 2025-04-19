@@ -1,48 +1,30 @@
-// Copyright (C) 2014 The Protocol Authors.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
 
 import (
+	"strings"
 	"testing"
 )
 
-func TestGenerate(t *testing.T) {
-	// Base 6 Luhn
-	a := luhnAlphabet("abcdef")
-	c, err := a.generate("abcdef")
+func TestLuhn32(t *testing.T) {
+	c, err := luhn32("AB725E4GHIQPL3ZFGT")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c != 'e' {
-		t.Errorf("Incorrect check digit %c != e", c)
+	if c != 'G' {
+		t.Errorf("Incorrect check digit %c != G", c)
 	}
 
-	// Base 10 Luhn
-	a = luhnAlphabet("0123456789")
-	c, err = a.generate("7992739871")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c != '3' {
-		t.Errorf("Incorrect check digit %c != 3", c)
-	}
-}
-
-func TestInvalidString(t *testing.T) {
-	a := luhnAlphabet("ABC")
-	_, err := a.generate("7992739871")
-	t.Log(err)
+	_, err = luhn32("3734EJEKMRHWPZQTWYQ1")
 	if err == nil {
 		t.Error("Unexpected nil error")
 	}
-}
-
-func TestValidate(t *testing.T) {
-	a := luhnAlphabet("abcdef")
-	if !a.luhnValidate("abcdefe") {
-		t.Errorf("Incorrect validation response for abcdefe")
-	}
-	if a.luhnValidate("abcdefd") {
-		t.Errorf("Incorrect validation response for abcdefd")
+	if !strings.Contains(err.Error(), "'1'") {
+		t.Errorf("luhn32 should have errored on digit '1', got %v", err)
 	}
 }

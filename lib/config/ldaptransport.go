@@ -6,12 +6,12 @@
 
 package config
 
-type LDAPTransport int
+type LDAPTransport int32
 
 const (
-	LDAPTransportPlain LDAPTransport = iota // default is plain
-	LDAPTransportTLS
-	LDAPTransportStartTLS
+	LDAPTransportPlain    LDAPTransport = 0
+	LDAPTransportTLS      LDAPTransport = 2
+	LDAPTransportStartTLS LDAPTransport = 3
 )
 
 func (t LDAPTransport) String() string {

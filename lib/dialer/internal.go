@@ -7,6 +7,7 @@
 package dialer
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,9 +16,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-var (
-	noFallback = os.Getenv("ALL_PROXY_NO_FALLBACK") != ""
-)
+var noFallback = os.Getenv("ALL_PROXY_NO_FALLBACK") != ""
 
 func init() {
 	proxy.RegisterDialerType("socks", socksDialerFunction)
@@ -29,7 +28,7 @@ func init() {
 			TLSHandshakeTimeout: 10 * time.Second,
 		}
 
-		// Defer this, so that logging gets setup.
+		// Defer this, so that logging gets set up.
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			l.Infoln("Proxy settings detected")
@@ -57,4 +56,37 @@ func socksDialerFunction(u *url.URL, forward proxy.Dialer) (proxy.Dialer, error)
 	}
 
 	return proxy.SOCKS5("tcp", u.Host, auth, forward)
+}
+
+// dialerConn is needed because proxy dialed connections have RemoteAddr() pointing at the proxy,
+// which then screws up various things such as IsLAN checks, and "let's populate the relay invitation address from
+// existing connection" shenanigans.
+type dialerConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c dialerConn) RemoteAddr() net.Addr {
+	return c.addr
+}
+
+func newDialerAddr(network, addr string) net.Addr {
+	netAddr, err := net.ResolveIPAddr(network, addr)
+	if err == nil {
+		return netAddr
+	}
+	return fallbackAddr{network, addr}
+}
+
+type fallbackAddr struct {
+	network string
+	addr    string
+}
+
+func (a fallbackAddr) Network() string {
+	return a.network
+}
+
+func (a fallbackAddr) String() string {
+	return a.addr
 }

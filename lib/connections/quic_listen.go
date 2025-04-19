@@ -4,27 +4,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// +build go1.12
+//go:build !noquic
+// +build !noquic
 
 package connections
 
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/connections/registry"
 	"github.com/syncthing/syncthing/lib/nat"
 	"github.com/syncthing/syncthing/lib/stun"
-	"github.com/syncthing/syncthing/lib/util"
+	"github.com/syncthing/syncthing/lib/svcutil"
 )
 
 func init() {
@@ -35,18 +36,21 @@ func init() {
 }
 
 type quicListener struct {
-	util.ServiceWithError
-	nat atomic.Value
+	svcutil.ServiceWithError
+	nat atomic.Uint64 // Holds a stun.NATType.
 
 	onAddressesChangedNotifier
 
-	uri     *url.URL
-	cfg     config.Wrapper
-	tlsCfg  *tls.Config
-	conns   chan internalConn
-	factory listenerFactory
+	uri        *url.URL
+	cfg        config.Wrapper
+	tlsCfg     *tls.Config
+	conns      chan internalConn
+	factory    listenerFactory
+	registry   *registry.Registry
+	lanChecker *lanChecker
 
 	address *url.URL
+	laddr   net.Addr
 	mut     sync.Mutex
 }
 
@@ -54,7 +58,7 @@ func (t *quicListener) OnNATTypeChanged(natType stun.NATType) {
 	if natType != stun.NATUnknown {
 		l.Infof("%s detected NAT type: %s", t.uri, natType)
 	}
-	t.nat.Store(natType)
+	t.nat.Store(uint64(natType))
 }
 
 func (t *quicListener) OnExternalAddressChanged(address *stun.Host, via string) {
@@ -79,33 +83,57 @@ func (t *quicListener) OnExternalAddressChanged(address *stun.Host, via string) 
 }
 
 func (t *quicListener) serve(ctx context.Context) error {
-	network := strings.Replace(t.uri.Scheme, "quic", "udp", -1)
+	network := quicNetwork(t.uri)
 
-	packetConn, err := net.ListenPacket(network, t.uri.Host)
+	udpAddr, err := net.ResolveUDPAddr(network, t.uri.Host)
 	if err != nil {
 		l.Infoln("Listen (BEP/quic):", err)
 		return err
 	}
-	defer func() { _ = packetConn.Close() }()
 
-	svc, conn := stun.New(t.cfg, t, packetConn)
-	defer func() { _ = conn.Close() }()
+	udpConn, err := net.ListenUDP(network, udpAddr)
+	if err != nil {
+		l.Infoln("Listen (BEP/quic):", err)
+		return err
+	}
+	defer udpConn.Close()
 
-	go svc.Serve()
-	defer svc.Stop()
+	tracer := &writeTrackingTracer{}
+	quicTransport := &quic.Transport{
+		Conn:   udpConn,
+		Tracer: tracer.loggingTracer(),
+	}
+	defer quicTransport.Close()
 
-	registry.Register(t.uri.Scheme, conn)
-	defer registry.Unregister(t.uri.Scheme, conn)
+	svc := stun.New(t.cfg, t, &transportPacketConn{tran: quicTransport}, tracer)
+	stunCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go svc.Serve(stunCtx)
 
-	listener, err := quic.Listen(conn, t.tlsCfg, quicConfig)
+	t.registry.Register(t.uri.Scheme, quicTransport)
+	defer t.registry.Unregister(t.uri.Scheme, quicTransport)
+
+	listener, err := quicTransport.Listen(t.tlsCfg, quicConfig)
 	if err != nil {
 		l.Infoln("Listen (BEP/quic):", err)
 		return err
 	}
 	defer listener.Close()
 
-	l.Infof("QUIC listener (%v) starting", packetConn.LocalAddr())
-	defer l.Infof("QUIC listener (%v) shutting down", packetConn.LocalAddr())
+	t.notifyAddressesChanged(t)
+	defer t.clearAddresses(t)
+
+	l.Infof("QUIC listener (%v) starting", udpConn.LocalAddr())
+	defer l.Infof("QUIC listener (%v) shutting down", udpConn.LocalAddr())
+
+	t.mut.Lock()
+	t.laddr = udpConn.LocalAddr()
+	t.mut.Unlock()
+	defer func() {
+		t.mut.Lock()
+		t.laddr = nil
+		t.mut.Unlock()
+	}()
 
 	acceptFailures := 0
 	const maxAcceptFailures = 10
@@ -113,12 +141,12 @@ func (t *quicListener) serve(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return ctx.Err()
 		default:
 		}
 
 		session, err := listener.Accept(ctx)
-		if err == context.Canceled {
+		if errors.Is(err, context.Canceled) {
 			return nil
 		} else if err != nil {
 			l.Infoln("Listen (BEP/quic): Accepting connection:", err)
@@ -145,11 +173,16 @@ func (t *quicListener) serve(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			l.Debugf("failed to accept stream from %s: %v", session.RemoteAddr(), err)
-			_ = session.Close()
+			_ = session.CloseWithError(1, err.Error())
 			continue
 		}
 
-		t.conns <- internalConn{&quicTlsConn{session, stream, nil}, connTypeQUICServer, quicPriority}
+		priority := t.cfg.Options().ConnectionPriorityQUICWAN
+		isLocal := t.lanChecker.isLAN(session.RemoteAddr())
+		if isLocal {
+			priority = t.cfg.Options().ConnectionPriorityQUICLAN
+		}
+		t.conns <- newInternalConn(&quicTlsConn{session, stream, nil}, connTypeQUICServer, isLocal, priority)
 	}
 }
 
@@ -158,8 +191,8 @@ func (t *quicListener) URI() *url.URL {
 }
 
 func (t *quicListener) WANAddresses() []*url.URL {
-	uris := t.LANAddresses()
 	t.mut.Lock()
+	uris := []*url.URL{maybeReplacePort(t.uri, t.laddr)}
 	if t.address != nil {
 		uris = append(uris, t.address)
 	}
@@ -168,7 +201,13 @@ func (t *quicListener) WANAddresses() []*url.URL {
 }
 
 func (t *quicListener) LANAddresses() []*url.URL {
-	return []*url.URL{t.uri}
+	t.mut.Lock()
+	uri := maybeReplacePort(t.uri, t.laddr)
+	t.mut.Unlock()
+	addrs := []*url.URL{uri}
+	network := quicNetwork(uri)
+	addrs = append(addrs, getURLsForAllAdaptersIfUnspecified(network, uri)...)
+	return addrs
 }
 
 func (t *quicListener) String() string {
@@ -180,7 +219,7 @@ func (t *quicListener) Factory() listenerFactory {
 }
 
 func (t *quicListener) NATType() string {
-	v := t.nat.Load().(stun.NATType)
+	v := stun.NATType(t.nat.Load())
 	if v == stun.NATUnknown || v == stun.NATError {
 		return "unknown"
 	}
@@ -189,23 +228,25 @@ func (t *quicListener) NATType() string {
 
 type quicListenerFactory struct{}
 
-func (f *quicListenerFactory) Valid(config.Configuration) error {
+func (*quicListenerFactory) Valid(config.Configuration) error {
 	return nil
 }
 
-func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+func (f *quicListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, _ *nat.Service, registry *registry.Registry, lanChecker *lanChecker) genericListener {
 	l := &quicListener{
-		uri:     fixupPort(uri, config.DefaultQUICPort),
-		cfg:     cfg,
-		tlsCfg:  tlsCfg,
-		conns:   conns,
-		factory: f,
+		uri:        fixupPort(uri, config.DefaultQUICPort),
+		cfg:        cfg,
+		tlsCfg:     tlsCfg,
+		conns:      conns,
+		factory:    f,
+		registry:   registry,
+		lanChecker: lanChecker,
 	}
-	l.ServiceWithError = util.AsServiceWithError(l.serve, l.String())
-	l.nat.Store(stun.NATUnknown)
+	l.ServiceWithError = svcutil.AsService(l.serve, l.String())
+	l.nat.Store(uint64(stun.NATUnknown))
 	return l
 }
 
-func (quicListenerFactory) Enabled(cfg config.Configuration) bool {
+func (quicListenerFactory) Enabled(_ config.Configuration) bool {
 	return true
 }

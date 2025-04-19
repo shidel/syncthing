@@ -16,13 +16,12 @@ var syncthing = angular.module('syncthing', [
 ]);
 
 var urlbase = 'rest';
+var authUrlbase = urlbase + '/noauth/auth';
+
+// keep consistent with ShortIDStringLength in lib/protocol/deviceid.go
+var shortIDStringLength = 7;
 
 syncthing.config(function ($httpProvider, $translateProvider, LocaleServiceProvider) {
-    var deviceIDShort = metadata.deviceID.substr(0, 5);
-    $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token-' + deviceIDShort;
-    $httpProvider.defaults.xsrfCookieName = 'CSRF-Token-' + deviceIDShort;
-    $httpProvider.useApplyAsync(true);
-
     // language and localisation
 
     $translateProvider.useSanitizeValueStrategy('escape');
@@ -30,9 +29,21 @@ syncthing.config(function ($httpProvider, $translateProvider, LocaleServiceProvi
         prefix: 'assets/lang/lang-',
         suffix: '.json'
     });
+    $translateProvider.fallbackLanguage('en');
 
     LocaleServiceProvider.setAvailableLocales(validLangs);
     LocaleServiceProvider.setDefaultLocale('en');
+
+    $httpProvider.useApplyAsync(true);
+
+    if (!window.metadata) {
+        // Most likely we're not authenticated yet, in which case we can't proceed with the rest of the setup.
+        // Do nothing and wait for the page reload on successful login.
+        return;
+    }
+
+    $httpProvider.defaults.xsrfHeaderName = 'X-CSRF-Token-' + metadata.deviceIDShort;
+    $httpProvider.defaults.xsrfCookieName = 'CSRF-Token-' + metadata.deviceIDShort;
 });
 
 // @TODO: extract global level functions into separate service(s)
@@ -72,6 +83,15 @@ function deviceMap(l) {
         m[r.deviceID] = r;
     });
     return m;
+}
+
+function deviceList(m) {
+    var l = [];
+    for (var id in m) {
+        l.push(m[id]);
+    }
+    l.sort(deviceCompare);
+    return l;
 }
 
 function folderMap(l) {
@@ -175,7 +195,7 @@ function buildTree(children) {
             keySoFar.push(part);
             var found = false;
             for (var i = 0; i < parent.children.length; i++) {
-                if (parent.children[i].title == part) {
+                if (parent.children[i].title == part && parent.children[i].folder === true) {
                     parent = parent.children[i];
                     found = true;
                     break;
@@ -206,7 +226,7 @@ function buildTree(children) {
 
 // unitPrefixed converts the input such that it returns a string representation
 // <1000 (<1024) with the metric unit prefix suffixed. I.e. when calling this with
-// binary == true, you need to suffix an additon 'i'.  The "biggest" prefix used
+// binary == true, you need to suffix an addition 'i'.  The "biggest" prefix used
 // is 'T', numbers > 1000T are just returned as such big numbers. If ever deemed
 // useful 'P' can be added easily.
 function unitPrefixed(input, binary) {

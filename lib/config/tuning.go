@@ -6,13 +6,12 @@
 
 package config
 
-type Tuning int
+type Tuning int32
 
 const (
-	// N.b. these constants must match those in lib/db.Tuning!
-	TuningAuto Tuning = iota // default is auto
-	TuningSmall
-	TuningLarge
+	TuningAuto  Tuning = 0
+	TuningSmall Tuning = 1
+	TuningLarge Tuning = 2
 )
 
 func (t Tuning) String() string {

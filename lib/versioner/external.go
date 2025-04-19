@@ -7,13 +7,16 @@
 package versioner
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/build"
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
 
 	"github.com/kballard/go-shellquote"
@@ -29,16 +32,16 @@ type external struct {
 	filesystem fs.Filesystem
 }
 
-func newExternal(filesystem fs.Filesystem, params map[string]string) Versioner {
-	command := params["command"]
+func newExternal(cfg config.FolderConfiguration) Versioner {
+	command := cfg.Versioning.Params["command"]
 
-	if runtime.GOOS == "windows" {
-		command = strings.Replace(command, `\`, `\\`, -1)
+	if build.IsWindows {
+		command = strings.ReplaceAll(command, `\`, `\\`)
 	}
 
 	s := external{
 		command:    command,
-		filesystem: filesystem,
+		filesystem: cfg.Filesystem(nil),
 	}
 
 	l.Debugf("instantiated %#v", s)
@@ -62,23 +65,23 @@ func (v external) Archive(filePath string) error {
 	l.Debugln("archiving", filePath)
 
 	if v.command == "" {
-		return errors.New("Versioner: command is empty, please enter a valid command")
+		return errors.New("command is empty, please enter a valid command")
 	}
 
 	words, err := shellquote.Split(v.command)
 	if err != nil {
-		return errors.New("Versioner: command is invalid: " + err.Error())
+		return fmt.Errorf("command is invalid: %w", err)
 	}
 
 	context := map[string]string{
-		"%FOLDER_FILESYSTEM%": v.filesystem.Type().String(),
+		"%FOLDER_FILESYSTEM%": string(v.filesystem.Type()),
 		"%FOLDER_PATH%":       v.filesystem.URI(),
 		"%FILE_PATH%":         filePath,
 	}
 
 	for i, word := range words {
 		for key, val := range context {
-			word = strings.Replace(word, key, val, -1)
+			word = strings.ReplaceAll(word, key, val)
 		}
 
 		words[i] = word
@@ -87,7 +90,8 @@ func (v external) Archive(filePath string) error {
 	cmd := exec.Command(words[0], words[1:]...)
 	env := os.Environ()
 	// filter STGUIAUTH and STGUIAPIKEY from environment variables
-	filteredEnv := []string{}
+	var filteredEnv []string
+
 	for _, x := range env {
 		if !strings.HasPrefix(x, "STGUIAUTH=") && !strings.HasPrefix(x, "STGUIAPIKEY=") {
 			filteredEnv = append(filteredEnv, x)
@@ -97,6 +101,9 @@ func (v external) Archive(filePath string) error {
 	combinedOutput, err := cmd.CombinedOutput()
 	l.Debugln("external command output:", string(combinedOutput))
 	if err != nil {
+		if eerr, ok := err.(*exec.ExitError); ok && len(eerr.Stderr) > 0 {
+			return fmt.Errorf("%v: %v", err, string(eerr.Stderr))
+		}
 		return err
 	}
 
@@ -104,13 +111,17 @@ func (v external) Archive(filePath string) error {
 	if _, err = v.filesystem.Lstat(filePath); fs.IsNotExist(err) {
 		return nil
 	}
-	return errors.New("Versioner: file was not removed by external script")
+	return errors.New("file was not removed by external script")
 }
 
-func (v external) GetVersions() (map[string][]FileVersion, error) {
+func (external) GetVersions() (map[string][]FileVersion, error) {
 	return nil, ErrRestorationNotSupported
 }
 
-func (v external) Restore(filePath string, versionTime time.Time) error {
+func (external) Restore(_ string, _ time.Time) error {
 	return ErrRestorationNotSupported
+}
+
+func (external) Clean(_ context.Context) error {
+	return nil
 }

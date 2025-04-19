@@ -7,8 +7,14 @@
 package backend
 
 import (
+	"errors"
 	"sync"
 )
+
+// CommitHook is a function that is executed before a WriteTransaction is
+// committed or before it is flushed to disk, e.g. on calling CheckPoint. The
+// transaction can be accessed via a closure.
+type CommitHook func(WriteTransaction) error
 
 // The Reader interface specifies the read-only operations available on the
 // main database and on read-only transactions (snapshots). Note that when
@@ -47,7 +53,11 @@ type ReadTransaction interface {
 // A Checkpoint is a potential partial commit of the transaction so far, for
 // purposes of saving memory when transactions are in-RAM. Note that
 // transactions may be checkpointed *anyway* even if this is not called, due to
-// resource constraints, but this gives you a chance to decide when.
+// resource constraints, but this gives you a chance to decide when. If, and
+// only if, calling Checkpoint will result in a partial commit/flush, the
+// CommitHooks passed to Backend.NewWriteTransaction are called before
+// committing. If any of those returns an error, committing is aborted and the
+// error bubbled.
 type WriteTransaction interface {
 	ReadTransaction
 	Writer
@@ -62,17 +72,17 @@ type WriteTransaction interface {
 // there is an error preventing iteration, which is then returned by
 // Error(). For example:
 //
-//     it, err := db.NewPrefixIterator(nil)
-//     if err != nil {
-//         // problem preventing iteration
-//     }
-//     defer it.Release()
-//     for it.Next() {
-//         // ...
-//     }
-//     if err := it.Error(); err != nil {
-//         // there was a database problem while iterating
-//     }
+//	it, err := db.NewPrefixIterator(nil)
+//	if err != nil {
+//	    // problem preventing iteration
+//	}
+//	defer it.Release()
+//	for it.Next() {
+//	    // ...
+//	}
+//	if err := it.Error(); err != nil {
+//	    // there was a database problem while iterating
+//	}
 //
 // An iterator must be Released when no longer required. The Error method
 // can be called either before or after Release with the same results. If an
@@ -94,12 +104,16 @@ type Iterator interface {
 // consider always using a transaction of the appropriate type. The
 // transaction isolation level is "read committed" - there are no dirty
 // reads.
+// Location returns the path to the database, as given to Open. The returned string
+// is empty for a db in memory.
 type Backend interface {
 	Reader
 	Writer
 	NewReadTransaction() (ReadTransaction, error)
-	NewWriteTransaction() (WriteTransaction, error)
+	NewWriteTransaction(hooks ...CommitHook) (WriteTransaction, error)
 	Close() error
+	Compact() error
+	Location() string
 }
 
 type Tuning int
@@ -119,52 +133,55 @@ func OpenMemory() Backend {
 	return OpenLevelDBMemory()
 }
 
-type errClosed struct{}
+var (
+	errClosed   = errors.New("database is closed")
+	errNotFound = errors.New("key not found")
+)
 
-func (errClosed) Error() string { return "database is closed" }
-
-type errNotFound struct{}
-
-func (errNotFound) Error() string { return "key not found" }
-
-func IsClosed(err error) bool {
-	if _, ok := err.(errClosed); ok {
-		return true
-	}
-	if _, ok := err.(*errClosed); ok {
-		return true
-	}
-	return false
-}
-
-func IsNotFound(err error) bool {
-	if _, ok := err.(errNotFound); ok {
-		return true
-	}
-	if _, ok := err.(*errNotFound); ok {
-		return true
-	}
-	return false
-}
+func IsClosed(err error) bool   { return errors.Is(err, errClosed) }
+func IsNotFound(err error) bool { return errors.Is(err, errNotFound) }
 
 // releaser manages counting on top of a waitgroup
 type releaser struct {
-	wg   *sync.WaitGroup
-	once *sync.Once
+	wg   *closeWaitGroup
+	once sync.Once
 }
 
-func newReleaser(wg *sync.WaitGroup) *releaser {
-	wg.Add(1)
-	return &releaser{
-		wg:   wg,
-		once: new(sync.Once),
+func newReleaser(wg *closeWaitGroup) (*releaser, error) {
+	if err := wg.Add(1); err != nil {
+		return nil, err
 	}
+	return &releaser{wg: wg}, nil
 }
 
-func (r releaser) Release() {
+func (r *releaser) Release() {
 	// We use the Once because we may get called multiple times from
 	// Commit() and deferred Release().
-	r.once.Do(func() {
-		r.wg.Done()
-	})
+	r.once.Do(r.wg.Done)
+}
+
+// closeWaitGroup behaves just like a sync.WaitGroup, but does not require
+// a single routine to do the Add and Wait calls. If Add is called after
+// CloseWait, it will return an error, and both are safe to be used concurrently.
+type closeWaitGroup struct {
+	sync.WaitGroup
+	closed   bool
+	closeMut sync.RWMutex
+}
+
+func (cg *closeWaitGroup) Add(i int) error {
+	cg.closeMut.RLock()
+	defer cg.closeMut.RUnlock()
+	if cg.closed {
+		return errClosed
+	}
+	cg.WaitGroup.Add(i)
+	return nil
+}
+
+func (cg *closeWaitGroup) CloseWait() {
+	cg.closeMut.Lock()
+	cg.closed = true
+	cg.closeMut.Unlock()
+	cg.WaitGroup.Wait()
 }

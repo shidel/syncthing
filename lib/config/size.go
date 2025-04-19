@@ -21,7 +21,7 @@ type Size struct {
 
 func ParseSize(s string) (Size, error) {
 	s = strings.TrimSpace(s)
-	if len(s) == 0 {
+	if s == "" {
 		return Size{}, nil
 	}
 
@@ -29,7 +29,7 @@ func ParseSize(s string) (Size, error) {
 	for i := 0; i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.' || s[i] == ','); i++ {
 		num = s[:i+1]
 	}
-	var i = len(num)
+	i := len(num)
 	for i < len(s) && s[i] == ' ' {
 		i++
 	}
@@ -78,25 +78,36 @@ func (s *Size) ParseDefault(str string) error {
 	return err
 }
 
-func CheckFreeSpace(req Size, usage fs.Usage) error {
-	val := req.BaseValue()
+// CheckFreeSpace checks that the free space does not fall below the minimum required free space.
+func CheckFreeSpace(minFree Size, usage fs.Usage) error {
+	val := minFree.BaseValue()
 	if val <= 0 {
 		return nil
 	}
 
-	if req.Percentage() {
+	if minFree.Percentage() {
 		freePct := (float64(usage.Free) / float64(usage.Total)) * 100
 		if freePct < val {
-			return fmt.Errorf("%.1f %% < %v", freePct, req)
+			return fmt.Errorf("current %.2f %% < required %v", freePct, minFree)
 		}
 	} else if float64(usage.Free) < val {
-		return fmt.Errorf("%sB < %v", formatSI(usage.Free), req)
+		return fmt.Errorf("current %sB < required %v", formatSI(usage.Free), minFree)
 	}
 
 	return nil
 }
 
-func formatSI(b int64) string {
+// checkAvailableSpace checks that the free space does not fall below the minimum
+// required free space, considering additional required space for a future operation.
+func checkAvailableSpace(req uint64, minFree Size, usage fs.Usage) error {
+	if usage.Free < req {
+		return fmt.Errorf("current %sB < required %sB", formatSI(usage.Free), formatSI(req))
+	}
+	usage.Free -= req
+	return CheckFreeSpace(minFree, usage)
+}
+
+func formatSI(b uint64) string {
 	switch {
 	case b < 1000:
 		return fmt.Sprintf("%d ", b)

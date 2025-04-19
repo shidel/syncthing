@@ -10,12 +10,13 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/syncthing/syncthing/lib/db/backend"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-var f1, f2, f3 protocol.FileInfo
-var folders = []string{"folder1", "folder2"}
+var (
+	f1, f2, f3 protocol.FileInfo
+	folders    = []string{"folder1", "folder2"}
+)
 
 func init() {
 	blocks := genBlocks(30)
@@ -36,10 +37,9 @@ func init() {
 	}
 }
 
-func setup() (*Lowlevel, *BlockFinder) {
-	// Setup
-
-	db := NewLowlevel(backend.OpenMemory())
+func setup(t testing.TB) (*Lowlevel, *BlockFinder) {
+	t.Helper()
+	db := newLowlevelMemory(t)
 	return db, NewBlockFinder(db)
 }
 
@@ -76,7 +76,7 @@ func addToBlockMap(db *Lowlevel, folder []byte, fs []protocol.FileInfo) error {
 			}
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 func discardFromBlockMap(db *Lowlevel, folder []byte, fs []protocol.FileInfo) error {
@@ -101,11 +101,12 @@ func discardFromBlockMap(db *Lowlevel, folder []byte, fs []protocol.FileInfo) er
 			}
 		}
 	}
-	return t.commit()
+	return t.Commit()
 }
 
 func TestBlockMapAddUpdateWipe(t *testing.T) {
-	db, f := setup()
+	db, f := setup(t)
+	defer db.Close()
 
 	if !dbEmpty(db) {
 		t.Fatal("db not empty")
@@ -192,7 +193,8 @@ func TestBlockMapAddUpdateWipe(t *testing.T) {
 }
 
 func TestBlockFinderLookup(t *testing.T) {
-	db, f := setup()
+	db, f := setup(t)
+	defer db.Close()
 
 	folder1 := []byte("folder1")
 	folder2 := []byte("folder2")

@@ -9,16 +9,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/syncthing/syncthing/lib/sha256"
 )
 
 const (
@@ -62,7 +60,7 @@ func uploadPanicLogs(ctx context.Context, urlBase, dir string) {
 // the log contents. A HEAD request is made to see if the log has already
 // been reported. If not, a PUT is made with the log contents.
 func uploadPanicLog(ctx context.Context, urlBase, file string) error {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return err
 	}

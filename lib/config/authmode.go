@@ -6,11 +6,11 @@
 
 package config
 
-type AuthMode int
+type AuthMode int32
 
 const (
-	AuthModeStatic AuthMode = iota // default is static
-	AuthModeLDAP
+	AuthModeStatic AuthMode = 0
+	AuthModeLDAP   AuthMode = 1
 )
 
 func (t AuthMode) String() string {

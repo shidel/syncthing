@@ -4,14 +4,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//+build !windows
+//go:build !windows
+// +build !windows
 
 // (No syscall.Umask or the equivalent on Windows)
 
 package osutil
 
 import (
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
@@ -23,7 +23,7 @@ func TestTempFilePermissions(t *testing.T) {
 	oldMask := syscall.Umask(0)
 	defer syscall.Umask(oldMask)
 
-	fd, err := ioutil.TempFile("", "test")
+	fd, err := os.CreateTemp("", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestTempFilePermissions(t *testing.T) {
 	// The temp file should have 0600 permissions at the most, or we have a
 	// security problem in CreateAtomic.
 	t.Logf("Got 0%03o", info.Mode())
-	if info.Mode()&^0600 != 0 {
+	if info.Mode()&^0o600 != 0 {
 		t.Errorf("Permission 0%03o is too generous", info.Mode())
 	}
 }

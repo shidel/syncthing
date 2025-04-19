@@ -4,6 +4,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//go:build integration
 // +build integration
 
 package integration
@@ -26,7 +27,7 @@ func TestSymlinks(t *testing.T) {
 
 	// Use no versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id, events.NoopLogger)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{}
 	cfg.SetFolder(fld)
@@ -44,7 +45,7 @@ func TestSymlinksSimpleVersioning(t *testing.T) {
 
 	// Use simple versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id, events.NoopLogger)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{
 		Type:   "simple",
@@ -65,7 +66,7 @@ func TestSymlinksStaggeredVersioning(t *testing.T) {
 
 	// Use staggered versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _ := config.Load("h2/config.xml", id, events.NoopLogger)
+	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
 	fld := cfg.Folders()["default"]
 	fld.Versioning = config.VersioningConfiguration{
 		Type: "staggered",
@@ -101,7 +102,7 @@ func testSymlinks(t *testing.T) {
 
 	// A directory that we will replace with a symlink later
 
-	err = os.Mkdir("s1/dirToReplace", 0755)
+	err = os.Mkdir("s1/dirToReplace", 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +121,7 @@ func testSymlinks(t *testing.T) {
 
 	// A directory and a symlink to that directory
 
-	err = os.Mkdir("s1/dir", 0755)
+	err = os.Mkdir("s1/dir", 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +218,7 @@ func testSymlinks(t *testing.T) {
 		log.Fatal(err)
 	}
 
-	err = os.Mkdir("s1/repDirLink", 0755)
+	err = os.Mkdir("s1/repDirLink", 0o755)
 	if err != nil {
 		log.Fatal(err)
 	}

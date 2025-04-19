@@ -13,11 +13,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/thejerf/suture"
-
+	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/fs"
-	"github.com/syncthing/syncthing/lib/sync"
-	"github.com/syncthing/syncthing/lib/util"
 )
 
 func init() {
@@ -31,132 +28,39 @@ type interval struct {
 }
 
 type staggered struct {
-	suture.Service
-	cleanInterval int64
-	folderFs      fs.Filesystem
-	versionsFs    fs.Filesystem
-	interval      [4]interval
-	mutex         sync.Mutex
-
-	testCleanDone chan struct{}
+	folderFs        fs.Filesystem
+	versionsFs      fs.Filesystem
+	interval        [4]interval
+	copyRangeMethod fs.CopyRangeMethod
 }
 
-func newStaggered(folderFs fs.Filesystem, params map[string]string) Versioner {
+func newStaggered(cfg config.FolderConfiguration) Versioner {
+	params := cfg.Versioning.Params
 	maxAge, err := strconv.ParseInt(params["maxAge"], 10, 0)
 	if err != nil {
 		maxAge = 31536000 // Default: ~1 year
 	}
-	cleanInterval, err := strconv.ParseInt(params["cleanInterval"], 10, 0)
-	if err != nil {
-		cleanInterval = 3600 // Default: clean once per hour
-	}
 
-	// Backwards compatibility
-	params["fsPath"] = params["versionsPath"]
-	versionsFs := fsFromParams(folderFs, params)
+	versionsFs := versionerFsFromFolderCfg(cfg)
 
 	s := &staggered{
-		cleanInterval: cleanInterval,
-		folderFs:      folderFs,
-		versionsFs:    versionsFs,
+		folderFs:   cfg.Filesystem(nil),
+		versionsFs: versionsFs,
 		interval: [4]interval{
-			{30, 3600},       // first hour -> 30 sec between versions
-			{3600, 86400},    // next day -> 1 h between versions
-			{86400, 592000},  // next 30 days -> 1 day between versions
-			{604800, maxAge}, // next year -> 1 week between versions
+			{30, 60 * 60},                     // first hour -> 30 sec between versions
+			{60 * 60, 24 * 60 * 60},           // next day -> 1 h between versions
+			{24 * 60 * 60, 30 * 24 * 60 * 60}, // next 30 days -> 1 day between versions
+			{7 * 24 * 60 * 60, maxAge},        // next year -> 1 week between versions
 		},
-		mutex: sync.NewMutex(),
+		copyRangeMethod: cfg.CopyRangeMethod.ToFS(),
 	}
-	s.Service = util.AsService(s.serve, s.String())
 
 	l.Debugf("instantiated %#v", s)
 	return s
 }
 
-func (v *staggered) serve(ctx context.Context) {
-	v.clean()
-	if v.testCleanDone != nil {
-		close(v.testCleanDone)
-	}
-
-	tck := time.NewTicker(time.Duration(v.cleanInterval) * time.Second)
-	defer tck.Stop()
-	for {
-		select {
-		case <-tck.C:
-			v.clean()
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-func (v *staggered) clean() {
-	l.Debugln("Versioner clean: Waiting for lock on", v.versionsFs)
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-	l.Debugln("Versioner clean: Cleaning", v.versionsFs)
-
-	if _, err := v.versionsFs.Stat("."); fs.IsNotExist(err) {
-		// There is no need to clean a nonexistent dir.
-		return
-	}
-
-	versionsPerFile := make(map[string][]string)
-	dirTracker := make(emptyDirTracker)
-
-	walkFn := func(path string, f fs.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if f.IsDir() && !f.IsSymlink() {
-			dirTracker.addDir(path)
-			return nil
-		}
-
-		// Regular file, or possibly a symlink.
-		dirTracker.addFile(path)
-
-		name, _ := UntagFilename(path)
-		if name == "" {
-			return nil
-		}
-
-		versionsPerFile[name] = append(versionsPerFile[name], path)
-
-		return nil
-	}
-
-	if err := v.versionsFs.Walk(".", walkFn); err != nil {
-		l.Warnln("Versioner: error scanning versions dir", err)
-		return
-	}
-
-	for _, versionList := range versionsPerFile {
-		v.expire(versionList)
-	}
-
-	dirTracker.deleteEmptyDirs(v.versionsFs)
-
-	l.Debugln("Cleaner: Finished cleaning", v.versionsFs)
-}
-
-func (v *staggered) expire(versions []string) {
-	l.Debugln("Versioner: Expiring versions", versions)
-	for _, file := range v.toRemove(versions, time.Now()) {
-		if fi, err := v.versionsFs.Lstat(file); err != nil {
-			l.Warnln("versioner:", err)
-			continue
-		} else if fi.IsDir() {
-			l.Infof("non-file %q is named like a file version", file)
-			continue
-		}
-
-		if err := v.versionsFs.Remove(file); err != nil {
-			l.Warnf("Versioner: can't remove %q: %v", file, err)
-		}
-	}
+func (v *staggered) Clean(ctx context.Context) error {
+	return clean(ctx, v.versionsFs, v.toRemove)
 }
 
 func (v *staggered) toRemove(versions []string, now time.Time) []string {
@@ -212,15 +116,11 @@ func (v *staggered) toRemove(versions []string, now time.Time) []string {
 // Archive moves the named file away to a version archive. If this function
 // returns nil, the named file does not exist any more (has been archived).
 func (v *staggered) Archive(filePath string) error {
-	l.Debugln("Waiting for lock on ", v.versionsFs)
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-
-	if err := archiveFile(v.folderFs, v.versionsFs, filePath, TagFilename); err != nil {
+	if err := archiveFile(v.copyRangeMethod, v.folderFs, v.versionsFs, filePath, TagFilename); err != nil {
 		return err
 	}
 
-	v.expire(findAllVersions(v.versionsFs, filePath))
+	cleanVersions(v.versionsFs, findAllVersions(v.versionsFs, filePath), v.toRemove)
 
 	return nil
 }
@@ -230,7 +130,7 @@ func (v *staggered) GetVersions() (map[string][]FileVersion, error) {
 }
 
 func (v *staggered) Restore(filepath string, versionTime time.Time) error {
-	return restoreFile(v.versionsFs, v.folderFs, filepath, versionTime, TagFilename)
+	return restoreFile(v.copyRangeMethod, v.versionsFs, v.folderFs, filepath, versionTime, TagFilename)
 }
 
 func (v *staggered) String() string {

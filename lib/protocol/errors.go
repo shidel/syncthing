@@ -1,44 +1,41 @@
-// Copyright (C) 2014 The Protocol Authors.
+// Copyright (C) 2014 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
 
-import (
-	"errors"
-)
+import "errors"
 
 var (
-	ErrNoError    error
 	ErrGeneric    = errors.New("generic error")
 	ErrNoSuchFile = errors.New("no such file")
 	ErrInvalid    = errors.New("file is invalid")
 )
 
-var lookupError = map[ErrorCode]error{
-	ErrorCodeNoError:     ErrNoError,
-	ErrorCodeGeneric:     ErrGeneric,
-	ErrorCodeNoSuchFile:  ErrNoSuchFile,
-	ErrorCodeInvalidFile: ErrInvalid,
-}
-
-var lookupCode = map[error]ErrorCode{
-	ErrNoError:    ErrorCodeNoError,
-	ErrGeneric:    ErrorCodeGeneric,
-	ErrNoSuchFile: ErrorCodeNoSuchFile,
-	ErrInvalid:    ErrorCodeInvalidFile,
-}
-
 func codeToError(code ErrorCode) error {
-	err, ok := lookupError[code]
-	if !ok {
+	switch code {
+	case ErrorCodeNoError:
+		return nil
+	case ErrorCodeNoSuchFile:
+		return ErrNoSuchFile
+	case ErrorCodeInvalidFile:
+		return ErrInvalid
+	default:
 		return ErrGeneric
 	}
-	return err
 }
 
 func errorToCode(err error) ErrorCode {
-	code, ok := lookupCode[err]
-	if !ok {
+	switch {
+	case err == nil:
+		return ErrorCodeNoError
+	case errors.Is(err, ErrNoSuchFile):
+		return ErrorCodeNoSuchFile
+	case errors.Is(err, ErrInvalid):
+		return ErrorCodeInvalidFile
+	default:
 		return ErrorCodeGeneric
 	}
-	return code
 }

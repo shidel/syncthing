@@ -1,35 +1,97 @@
-// Copyright (C) 2015 The Protocol Authors.
+// Copyright (C) 2015 The Syncthing Authors.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package protocol
+
+import (
+	"time"
+
+	"github.com/syncthing/syncthing/internal/gen/bep"
+)
 
 // The Vector type represents a version vector. The zero value is a usable
 // version vector. The vector has slice semantics and some operations on it
 // are "append-like" in that they may return the same vector modified, or v
 // new allocated Vector with the modified contents.
+type Vector struct {
+	Counters []Counter
+}
+
+func (v *Vector) ToWire() *bep.Vector {
+	counters := make([]*bep.Counter, len(v.Counters))
+	for i, c := range v.Counters {
+		counters[i] = c.toWire()
+	}
+	return &bep.Vector{
+		Counters: counters,
+	}
+}
+
+func VectorFromWire(w *bep.Vector) Vector {
+	var v Vector
+	if w == nil || len(w.Counters) == 0 {
+		return v
+	}
+	v.Counters = make([]Counter, len(w.Counters))
+	for i, c := range w.Counters {
+		v.Counters[i] = counterFromWire(c)
+	}
+	return v
+}
 
 // Counter represents a single counter in the version vector.
+type Counter struct {
+	ID    ShortID
+	Value uint64
+}
+
+func (c *Counter) toWire() *bep.Counter {
+	return &bep.Counter{
+		Id:    uint64(c.ID),
+		Value: c.Value,
+	}
+}
+
+func counterFromWire(w *bep.Counter) Counter {
+	return Counter{
+		ID:    ShortID(w.Id),
+		Value: w.Value,
+	}
+}
 
 // Update returns a Vector with the index for the specific ID incremented by
 // one. If it is possible, the vector v is updated and returned. If it is not,
 // a copy will be created, updated and returned.
 func (v Vector) Update(id ShortID) Vector {
+	now := uint64(time.Now().Unix())
+	return v.updateWithNow(id, now)
+}
+
+func (v Vector) updateWithNow(id ShortID, now uint64) Vector {
 	for i := range v.Counters {
 		if v.Counters[i].ID == id {
 			// Update an existing index
-			v.Counters[i].Value++
+			v.Counters[i].Value = max(v.Counters[i].Value+1, now)
 			return v
 		} else if v.Counters[i].ID > id {
 			// Insert a new index
 			nv := make([]Counter, len(v.Counters)+1)
 			copy(nv, v.Counters[:i])
 			nv[i].ID = id
-			nv[i].Value = 1
+			nv[i].Value = max(1, now)
 			copy(nv[i+1:], v.Counters[i:])
 			return Vector{Counters: nv}
 		}
 	}
+
 	// Append a new index
-	return Vector{Counters: append(v.Counters, Counter{ID: id, Value: 1})}
+	return Vector{Counters: append(v.Counters, Counter{
+		ID:    id,
+		Value: max(1, now),
+	})}
 }
 
 // Merge returns the vector containing the maximum indexes from v and b. If it
@@ -107,6 +169,11 @@ func (v Vector) Counter(id ShortID) uint64 {
 		}
 	}
 	return 0
+}
+
+// IsEmpty returns true when there are no counters.
+func (v Vector) IsEmpty() bool {
+	return len(v.Counters) == 0
 }
 
 // DropOthers removes all counters, keeping only the one with given id. If there

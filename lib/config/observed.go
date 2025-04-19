@@ -1,4 +1,4 @@
-// Copyright (C) 2018 The Syncthing Authors.
+// Copyright (C) 2014 The Syncthing Authors.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -13,14 +13,14 @@ import (
 )
 
 type ObservedFolder struct {
-	Time  time.Time `xml:"time,attr" json:"time"`
-	ID    string    `xml:"id,attr" json:"id"`
-	Label string    `xml:"label,attr" json:"label"`
+	Time  time.Time `json:"time" xml:"time,attr"`
+	ID    string    `json:"id" xml:"id,attr"`
+	Label string    `json:"label" xml:"label,attr"`
 }
 
 type ObservedDevice struct {
-	Time    time.Time         `xml:"time,attr" json:"time"`
-	ID      protocol.DeviceID `xml:"id,attr" json:"deviceID"`
-	Name    string            `xml:"name,attr" json:"name"`
-	Address string            `xml:"address,attr" json:"address"`
+	Time    time.Time         `json:"time" xml:"time,attr"`
+	ID      protocol.DeviceID `json:"deviceID" xml:"id,attr"`
+	Name    string            `json:"name" xml:"name,attr"`
+	Address string            `json:"address" xml:"address,attr"`
 }

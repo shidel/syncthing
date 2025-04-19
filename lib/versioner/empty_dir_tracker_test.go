@@ -14,19 +14,20 @@ import (
 )
 
 // TestEmptyDirs models the following .stversions structure:
-// .stversions/
-// ├── keep1
-// │   └── file1
-// ├── keep2
-// │   └── keep21
-// │       └── keep22
-// │           └── file1
-// ├── remove1
-// └── remove2
-//     └── remove21
-//         └── remove22
+//
+//	.stversions/
+//	├── keep1
+//	│   └── file1
+//	├── keep2
+//	│   └── keep21
+//	│       └── keep22
+//	│           └── file1
+//	├── remove1
+//	└── remove2
+//		└── remove21
+//		    └── remove22
 func TestEmptyDirs(t *testing.T) {
-	var paths = []struct {
+	paths := []struct {
 		path   string
 		isFile bool
 	}{
@@ -43,7 +44,7 @@ func TestEmptyDirs(t *testing.T) {
 		{"remove2/remove21/remove22", false},
 	}
 
-	var expected = []string{
+	expected := []string{
 		"remove2/remove21/remove22",
 		"remove2/remove21",
 		"remove2",

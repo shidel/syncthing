@@ -1,15 +1,18 @@
 // Copyright (C) 2014 Jakob Borg. All rights reserved. Use of this source code
 // is governed by an MIT-style license that can be found in the LICENSE file.
 
+//go:generate -command counterfeiter go run github.com/maxbrunsfeld/counterfeiter/v6
+//go:generate counterfeiter -o mocks/logger.go --fake-name Recorder . Recorder
+
 // Package logger implements a standardized logger with callback functionality
 package logger
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +32,7 @@ const (
 )
 
 const (
-	DefaultFlags = log.Ltime
+	DefaultFlags = log.Ltime | log.Ldate
 	DebugFlags   = log.Ltime | log.Ldate | log.Lmicroseconds | log.Lshortfile
 )
 
@@ -50,7 +53,6 @@ type Logger interface {
 	Warnf(format string, vals ...interface{})
 	ShouldDebug(facility string) bool
 	SetDebug(facility string, enabled bool)
-	IsTraced(facility string) bool
 	Facilities() map[string]string
 	FacilityDebugging() []string
 	NewFacility(facility, description string) Logger
@@ -61,7 +63,7 @@ type logger struct {
 	handlers   [NumLevels][]MessageHandler
 	facilities map[string]string   // facility name => description
 	debug      map[string]struct{} // only facility names with debugging enabled
-	traces     string
+	traces     []string
 	mut        sync.Mutex
 }
 
@@ -72,15 +74,27 @@ func New() Logger {
 	if os.Getenv("LOGGER_DISCARD") != "" {
 		// Hack to completely disable logging, for example when running
 		// benchmarks.
-		return newLogger(ioutil.Discard)
+		return newLogger(io.Discard)
 	}
 	return newLogger(controlStripper{os.Stdout})
 }
 
 func newLogger(w io.Writer) Logger {
+	traces := strings.FieldsFunc(os.Getenv("STTRACE"), func(r rune) bool {
+		return strings.ContainsRune(",; ", r)
+	})
+
+	if len(traces) > 0 {
+		if slices.Contains(traces, "all") {
+			traces = []string{"all"}
+		} else {
+			slices.Sort(traces)
+		}
+	}
+
 	return &logger{
 		logger:     log.New(w, "", DefaultFlags),
-		traces:     os.Getenv("STTRACE"),
+		traces:     traces,
 		facilities: make(map[string]string),
 		debug:      make(map[string]struct{}),
 	}
@@ -116,6 +130,7 @@ func (l *logger) callHandlers(level LogLevel, s string) {
 func (l *logger) Debugln(vals ...interface{}) {
 	l.debugln(3, vals...)
 }
+
 func (l *logger) debugln(level int, vals ...interface{}) {
 	s := fmt.Sprintln(vals...)
 	l.mut.Lock()
@@ -128,6 +143,7 @@ func (l *logger) debugln(level int, vals ...interface{}) {
 func (l *logger) Debugf(format string, vals ...interface{}) {
 	l.debugf(3, format, vals...)
 }
+
 func (l *logger) debugf(level int, format string, vals ...interface{}) {
 	s := fmt.Sprintf(format, vals...)
 	l.mut.Lock()
@@ -213,9 +229,18 @@ func (l *logger) SetDebug(facility string, enabled bool) {
 	}
 }
 
-// IsTraced returns whether the facility name is contained in STTRACE.
-func (l *logger) IsTraced(facility string) bool {
-	return strings.Contains(l.traces, facility) || l.traces == "all"
+// isTraced returns whether the facility name is contained in STTRACE.
+func (l *logger) isTraced(facility string) bool {
+	if len(l.traces) > 0 {
+		if l.traces[0] == "all" {
+			return true
+		}
+
+		_, found := slices.BinarySearch(l.traces, facility)
+		return found
+	}
+
+	return false
 }
 
 // FacilityDebugging returns the set of facilities that have debugging
@@ -244,7 +269,7 @@ func (l *logger) Facilities() map[string]string {
 
 // NewFacility returns a new logger bound to the named facility.
 func (l *logger) NewFacility(facility, description string) Logger {
-	l.SetDebug(facility, l.IsTraced(facility))
+	l.SetDebug(facility, l.isTraced(facility))
 
 	l.mut.Lock()
 	l.facilities[facility] = description
@@ -335,7 +360,7 @@ func (r *recorder) Clear() {
 
 func (r *recorder) append(l LogLevel, msg string) {
 	line := Line{
-		When:    time.Now(),
+		When:    time.Now(), // intentionally high precision
 		Message: msg,
 		Level:   l,
 	}

@@ -8,7 +8,6 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,14 +17,17 @@ import (
 func TestRotatedFile(t *testing.T) {
 	// Verify that log rotation happens.
 
-	dir, err := ioutil.TempDir("", "syncthing")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	open := func(name string) (io.WriteCloser, error) {
-		return os.Create(name)
+		f, err := os.Create(name)
+		t.Cleanup(func() {
+			if f != nil {
+				_ = f.Close()
+			}
+		})
+
+		return f, err
 	}
 
 	logName := filepath.Join(dir, "log.txt")
@@ -33,7 +35,10 @@ func TestRotatedFile(t *testing.T) {
 	maxSize := int64(len(testData) + len(testData)/2)
 
 	// We allow the log file plus two rotated copies.
-	rf := newRotatedFile(logName, open, maxSize, 2)
+	rf, err := newRotatedFile(logName, open, maxSize, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Write some bytes.
 	if _, err := rf.Write(testData); err != nil {
@@ -135,12 +140,15 @@ func checkNotExist(t *testing.T, name string) {
 func TestAutoClosedFile(t *testing.T) {
 	os.RemoveAll("_autoclose")
 	defer os.RemoveAll("_autoclose")
-	os.Mkdir("_autoclose", 0755)
+	os.Mkdir("_autoclose", 0o755)
 	file := filepath.FromSlash("_autoclose/tmp")
 	data := []byte("hello, world\n")
 
 	// An autoclosed file that closes very quickly
-	ac := newAutoclosedFile(file, time.Millisecond, time.Millisecond)
+	ac, err := newAutoclosedFile(file, time.Millisecond, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Write some data.
 	if _, err := ac.Write(data); err != nil {
@@ -173,7 +181,7 @@ func TestAutoClosedFile(t *testing.T) {
 	}
 
 	// The file should have both writes in it.
-	bs, err := ioutil.ReadFile(file)
+	bs, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,21 +190,23 @@ func TestAutoClosedFile(t *testing.T) {
 	}
 
 	// Open the file again.
-	ac = newAutoclosedFile(file, time.Second, time.Second)
+	ac, err = newAutoclosedFile(file, time.Second, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Write something
 	if _, err := ac.Write(data); err != nil {
 		t.Fatal(err)
 	}
 
-	// It should now contain only one write, because the first open
-	// should be a truncate.
-	bs, err = ioutil.ReadFile(file)
+	// It should now contain three writes, as the file is always opened for appending
+	bs, err = os.ReadFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bs) != len(data) {
-		t.Fatalf("Write failed, expected %d bytes, not %d", len(data), len(bs))
+	if len(bs) != 3*len(data) {
+		t.Fatalf("Write failed, expected %d bytes, not %d", 3*len(data), len(bs))
 	}
 
 	// Close.

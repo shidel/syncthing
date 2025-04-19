@@ -10,34 +10,73 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/syncthing/syncthing/lib/build"
 )
 
+const FilesystemTypeBasic FilesystemType = "basic"
+
 var (
-	ErrInvalidFilename = errors.New("filename is invalid")
-	ErrNotRelative     = errors.New("not a relative path")
+	errInvalidFilenameEmpty               = errors.New("name is invalid, must not be empty")
+	errInvalidFilenameWindowsSpacePeriod  = errors.New("name is invalid, must not end in space or period on Windows")
+	errInvalidFilenameWindowsReservedName = errors.New("name is invalid, contains Windows reserved name")
+	errInvalidFilenameWindowsReservedChar = errors.New("name is invalid, contains Windows reserved character")
 )
+
+type OptionJunctionsAsDirs struct{}
+
+func (*OptionJunctionsAsDirs) apply(fs Filesystem) Filesystem {
+	if basic, ok := fs.(*BasicFilesystem); !ok {
+		l.Warnln("WithJunctionsAsDirs must only be used with FilesystemTypeBasic")
+	} else {
+		basic.junctionsAsDirs = true
+	}
+	return fs
+}
+
+func (*OptionJunctionsAsDirs) String() string {
+	return "junctionsAsDirs"
+}
 
 // The BasicFilesystem implements all aspects by delegating to package os.
 // All paths are relative to the root and cannot (should not) escape the root directory.
 type BasicFilesystem struct {
-	root string
+	root            string
+	junctionsAsDirs bool
+	options         []Option
+	userCache       *userCache
+	groupCache      *groupCache
 }
 
-func newBasicFilesystem(root string) *BasicFilesystem {
+type (
+	userCache  = valueCache[string, *user.User]
+	groupCache = valueCache[string, *user.Group]
+)
+
+func init() {
+	RegisterFilesystemType(FilesystemTypeBasic, func(root string, opts ...Option) (Filesystem, error) {
+		return newBasicFilesystem(root, opts...), nil
+	})
+}
+
+func newBasicFilesystem(root string, opts ...Option) *BasicFilesystem {
+	if root == "" {
+		root = "." // Otherwise "" becomes "/" below
+	}
+
 	// The reason it's done like this:
 	// C:          ->  C:\            ->  C:\        (issue that this is trying to fix)
 	// C:\somedir  ->  C:\somedir\    ->  C:\somedir
-	// C:\somedir\ ->  C:\somedir\\   ->  C:\somedir
+	// C:\somedir\ ->  C:\somedir\    ->  C:\somedir
 	// This way in the tests, we get away without OS specific separators
 	// in the test configs.
 	sep := string(filepath.Separator)
-	root = filepath.Dir(root + sep)
+	root = filepath.Clean(filepath.Dir(root + sep))
 
 	// Attempt tilde expansion; leave unchanged in case of error
 	if path, err := ExpandTilde(root); err == nil {
@@ -56,11 +95,20 @@ func newBasicFilesystem(root string) *BasicFilesystem {
 
 	// Attempt to enable long filename support on Windows. We may still not
 	// have an absolute path here if the previous steps failed.
-	if runtime.GOOS == "windows" {
+	if build.IsWindows {
 		root = longFilenameSupport(root)
 	}
 
-	return &BasicFilesystem{root}
+	fs := &BasicFilesystem{
+		root:       root,
+		options:    opts,
+		userCache:  newValueCache(time.Hour, user.LookupId),
+		groupCache: newValueCache(time.Hour, user.LookupGroupId),
+	}
+	for _, opt := range opts {
+		opt.apply(fs)
+	}
+	return fs
 }
 
 // rooted expands the relative path to the full path that is then used with os
@@ -74,7 +122,7 @@ func (f *BasicFilesystem) rooted(rel string) (string, error) {
 func rooted(rel, root string) (string, error) {
 	// The root must not be empty.
 	if root == "" {
-		return "", ErrInvalidFilename
+		return "", errInvalidFilenameEmpty
 	}
 
 	var err error
@@ -97,14 +145,6 @@ func (f *BasicFilesystem) Chmod(name string, mode FileMode) error {
 		return err
 	}
 	return os.Chmod(name, os.FileMode(mode))
-}
-
-func (f *BasicFilesystem) Lchown(name string, uid, gid int) error {
-	name, err := f.rooted(name)
-	if err != nil {
-		return err
-	}
-	return os.Lchown(name, uid, gid)
 }
 
 func (f *BasicFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
@@ -141,19 +181,11 @@ func (f *BasicFilesystem) Lstat(name string) (FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	fi, err := underlyingLstat(name)
+	fi, err := f.underlyingLstat(name)
 	if err != nil {
 		return nil, err
 	}
 	return basicFileInfo{fi}, err
-}
-
-func (f *BasicFilesystem) Remove(name string) error {
-	name, err := f.rooted(name)
-	if err != nil {
-		return err
-	}
-	return os.Remove(name)
 }
 
 func (f *BasicFilesystem) RemoveAll(name string) error {
@@ -193,7 +225,7 @@ func (f *BasicFilesystem) DirNames(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := os.OpenFile(name, OptReadOnly, 0777)
+	fd, err := os.OpenFile(name, OptReadOnly, 0o777)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +275,7 @@ func (f *BasicFilesystem) Create(name string) (File, error) {
 	return basicFile{fd, name}, err
 }
 
-func (f *BasicFilesystem) Walk(root string, walkFn WalkFunc) error {
+func (*BasicFilesystem) Walk(_ string, _ WalkFunc) error {
 	// implemented in WalkFilesystem
 	return errors.New("not implemented")
 }
@@ -271,12 +303,12 @@ func (f *BasicFilesystem) Usage(name string) (Usage, error) {
 		return Usage{}, err
 	}
 	return Usage{
-		Free:  int64(u.Free),
-		Total: int64(u.Total),
+		Free:  u.Free,
+		Total: u.Total,
 	}, nil
 }
 
-func (f *BasicFilesystem) Type() FilesystemType {
+func (*BasicFilesystem) Type() FilesystemType {
 	return FilesystemTypeBasic
 }
 
@@ -284,7 +316,11 @@ func (f *BasicFilesystem) URI() string {
 	return strings.TrimPrefix(f.root, `\\?\`)
 }
 
-func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
+func (f *BasicFilesystem) Options() []Option {
+	return f.options
+}
+
+func (*BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 	// Like os.SameFile, we always return false unless fi1 and fi2 were created
 	// by this package's Stat/Lstat method.
 	f1, ok1 := fi1.(basicFileInfo)
@@ -293,7 +329,11 @@ func (f *BasicFilesystem) SameFile(fi1, fi2 FileInfo) bool {
 		return false
 	}
 
-	return os.SameFile(f1.FileInfo, f2.FileInfo)
+	return os.SameFile(f1.osFileInfo(), f2.osFileInfo())
+}
+
+func (*BasicFilesystem) underlying() (Filesystem, bool) {
+	return nil, false
 }
 
 // basicFile implements the fs.File interface on top of an os.File
